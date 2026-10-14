@@ -510,43 +510,48 @@ fn main() {
         install_app_menus(cx);
         let activation_services = Arc::clone(&services);
         cx.on_action(move |_: &commands::ShowApp, cx| {
-            let mut windows = cx.windows();
-            if let Some(active) = cx.active_window() {
-                windows.retain(|handle| *handle != active);
-                windows.insert(0, active);
-            }
-            let main = windows.into_iter().find(|handle| {
-                handle
-                    .update(cx, |root, _, _| root.downcast::<RootView>().is_ok())
-                    .unwrap_or(false)
-            });
-            if let Some(handle) = main {
-                #[cfg(target_os = "macos")]
-                if handle
-                    .update(cx, |_, window, _| {
-                        macos::global_shortcut::should_hide(window)
-                    })
-                    .unwrap_or(false)
-                {
-                    cx.hide();
-                    return;
+            let activation_services = Arc::clone(&activation_services);
+            // Action dispatch may hold the active window's mutable borrow.
+            // Wait until it is returned before inspecting or updating windows.
+            cx.defer(move |cx| {
+                let mut windows = cx.windows();
+                if let Some(active) = cx.active_window() {
+                    windows.retain(|handle| *handle != active);
+                    windows.insert(0, active);
                 }
-                let _ = handle.update(cx, |_, window, _| {
+                // Handle metadata is available even while a window is borrowed;
+                // a failed update must never mean that the main window is absent.
+                let main = windows
+                    .into_iter()
+                    .find(|handle| handle.downcast::<RootView>().is_some());
+                if let Some(handle) = main {
                     #[cfg(target_os = "macos")]
-                    macos::global_shortcut::reveal(window);
-                    #[cfg(not(target_os = "macos"))]
-                    window.activate_window();
-                });
-            } else {
-                open_main_window(
-                    cx,
-                    Arc::clone(&activation_services),
-                    preview,
-                    scenario,
-                    RestorePolicy::FRAME_ONLY,
-                );
-            }
-            cx.activate(true);
+                    if handle
+                        .update(cx, |_, window, _| {
+                            macos::global_shortcut::should_hide(window)
+                        })
+                        .unwrap_or(false)
+                    {
+                        cx.hide();
+                        return;
+                    }
+                    let _ = handle.update(cx, |_, window, _| {
+                        #[cfg(target_os = "macos")]
+                        macos::global_shortcut::reveal(window);
+                        #[cfg(not(target_os = "macos"))]
+                        window.activate_window();
+                    });
+                } else {
+                    open_main_window(
+                        cx,
+                        Arc::clone(&activation_services),
+                        preview,
+                        scenario,
+                        RestorePolicy::FRAME_ONLY,
+                    );
+                }
+                cx.activate(true);
+            });
         });
         #[cfg(target_os = "macos")]
         {
