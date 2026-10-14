@@ -42,7 +42,7 @@ impl RootView {
         self.notification_options_open = false;
         self.notification_scroll
             .scroll_to_item(0, ScrollStrategy::Top);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if self.notification_panel_open {
             self.notifier.refresh_health();
         }
@@ -798,7 +798,7 @@ impl RootView {
             .child(
                 option_button("notification-test", t("notify.test_alert"), colors).on_click(
                     cx.listener(|this, _, _, cx| {
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", windows))]
                         this.notifier
                             .post(&crate::notifications::NotificationRequest {
                                 session_event: false,
@@ -811,7 +811,7 @@ impl RootView {
                                 use_system_sound: false,
                                 reply: false,
                             });
-                        #[cfg(not(target_os = "macos"))]
+                        #[cfg(not(any(target_os = "macos", windows)))]
                         {
                             this.notification_health = t("notify.health_other_platform").into();
                         }

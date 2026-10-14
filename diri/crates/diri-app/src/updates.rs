@@ -10,33 +10,33 @@
 //! focus or interrupts a live session.
 
 use std::sync::Arc;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::i18n::{t, tf};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use diri_updater::UpdaterConfig;
 use diri_updater::{Release, UpdateChannel};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 use diri_updater::{Result as UpdateResult, SourceReport, StagedUpdate, UpdateError, Updater};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
 
 /// How long after launch the first background check runs. Long enough to stay
 /// out of the way of startup work.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(20);
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Small seam around the blocking updater so the service policy can be tested
 /// without a network request or a signed app bundle.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 trait UpdateBackend: Send + Sync {
     fn clean_cache(&self);
     fn check(&self, skipped: Option<&str>) -> UpdateResult<Option<Release>>;
@@ -58,7 +58,7 @@ trait UpdateBackend: Send + Sync {
     fn set_channel(&self, _channel: UpdateChannel) {}
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 impl UpdateBackend for Updater {
     fn clean_cache(&self) {
         Updater::clean_cache(self);
@@ -98,7 +98,7 @@ impl UpdateBackend for Updater {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 #[derive(Clone)]
 struct ReadyInstall {
     updater: Arc<dyn UpdateBackend>,
@@ -241,7 +241,7 @@ pub enum UpdateCommand {
 pub struct UpdateHandle {
     state: watch::Receiver<UpdateState>,
     commands: mpsc::UnboundedSender<UpdateCommand>,
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", windows, test))]
     ready_install: Arc<Mutex<Option<ReadyInstall>>>,
     automatic: Arc<AtomicBool>,
     // Preview mode keeps the watch open without spawning the updater service.
@@ -273,7 +273,7 @@ impl UpdateHandle {
     /// Launches the non-reopening swap helper when an automatic update is
     /// staged. This path is synchronous and bounded so quitting never waits
     /// behind an in-progress network download on the service task.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", windows, test))]
     pub fn install_on_quit(&self) {
         if !self.automatic.load(Ordering::SeqCst) {
             return;
@@ -303,11 +303,11 @@ impl UpdateHandle {
         }
     }
 
-    #[cfg(not(any(target_os = "macos", test)))]
+    #[cfg(not(any(target_os = "macos", windows, test)))]
     pub fn install_on_quit(&self) {}
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 /// One updater step for the flight recorder. A failure carries the error's
 /// class and its scrubbed text (release URLs are public; home paths and user
 /// names are scrubbed). `source` says which route answered — GitHub or the
@@ -375,13 +375,13 @@ pub fn spawn(
     skipped: Option<String>,
     channel: UpdateChannel,
 ) -> UpdateHandle {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (runtime, automatic, skipped, channel);
         unsupported(t("settings.updates.linux_unsupported"))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         let initial = UpdateState {
             current_version: CURRENT_VERSION.to_owned(),
@@ -427,7 +427,7 @@ pub fn spawn(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn unsupported(reason: impl Into<String>) -> UpdateHandle {
     let state = UpdateState {
         phase: UpdatePhase::Unsupported(reason.into()),
@@ -439,7 +439,7 @@ fn unsupported(reason: impl Into<String>) -> UpdateHandle {
     UpdateHandle {
         state: state_rx,
         commands: command_tx,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", windows, test))]
         ready_install: Arc::new(Mutex::new(None)),
         automatic: Arc::new(AtomicBool::new(false)),
         _inert_state: Some(state_tx),
@@ -458,14 +458,14 @@ pub fn inert() -> UpdateHandle {
     UpdateHandle {
         state: state_rx,
         commands: command_tx,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", windows, test))]
         ready_install: Arc::new(Mutex::new(None)),
         automatic: Arc::new(AtomicBool::new(false)),
         _inert_state: Some(state_tx),
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 struct Service {
     updater: Arc<dyn UpdateBackend>,
     state: watch::Sender<UpdateState>,
@@ -478,7 +478,7 @@ struct Service {
     ready_install: Arc<Mutex<Option<ReadyInstall>>>,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 async fn service(
     updater: Option<Arc<dyn UpdateBackend>>,
     automatic: bool,
@@ -531,7 +531,7 @@ async fn service(
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 impl Service {
     async fn handle(&mut self, command: UpdateCommand) {
         match command {

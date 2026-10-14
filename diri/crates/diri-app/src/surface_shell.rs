@@ -15,6 +15,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::window_chrome::TitlebarDragArea as _;
 use crate::delegation::worktree_move_proposal;
 use crate::i18n::{t, tf};
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
@@ -529,6 +530,9 @@ pub struct UtilitySurfaces {
     /// A display-link frame is already requested for the chart motion.
     usage_chart_frame_pending: bool,
     usage_numbers: crate::number_flow::Bank,
+    /// History, reports and chart samples derived from `usage`, so frames
+    /// (animation ticks, a pointer over the chart) do not rebuild them.
+    usage_derived: std::cell::RefCell<usage_page::UsageDerived>,
     /// Activity heatmap bins, rebuilt when the snapshot or source changes.
     usage_activity: usage_activity::ActivityCell,
     usage_activity_hover: Option<usage_activity::ActivityHover>,
@@ -631,7 +635,8 @@ impl UtilitySurfaces {
             }
         })
         .detach();
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let hosts_path = diri_proto::paths::DirijorPaths::hosts_config_file(&home);
@@ -774,6 +779,7 @@ impl UtilitySurfaces {
             usage_scrub: None,
             usage_chart_frame_pending: false,
             usage_numbers: crate::number_flow::Bank::default(),
+            usage_derived: Default::default(),
             usage_activity: Default::default(),
             usage_activity_hover: None,
             usage_activity_metric: Default::default(),
@@ -1254,7 +1260,8 @@ impl UtilitySurfaces {
     }
 
     fn consume_root_picks(&mut self, mut paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let mut text = self.roots_editor.text().to_owned();
@@ -1295,7 +1302,8 @@ impl UtilitySurfaces {
         let Some(prompt) = self.nested_root.take() else {
             return;
         };
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let mut text =
@@ -1373,11 +1381,9 @@ impl UtilitySurfaces {
     }
 
     fn reload_hosts(&mut self) {
-        self.hosts = HostsConfig::load(&self.hosts_path).hosts;
-        self.store
-            .write()
-            .expect("session store lock poisoned")
-            .set_hosts(self.hosts.clone());
+        let mut store = self.store.write().expect("session store lock poisoned");
+        store.reload_hosts();
+        self.hosts = store.hosts().to_vec();
     }
 
     fn begin_adding_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1388,6 +1394,19 @@ impl UtilitySurfaces {
     }
 
     fn begin_editing_host(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .hosts
+            .iter()
+            .any(|h| h.id == id && h.wsl_distribution().is_some())
+        {
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .set_default_spawn_host(Some(id.into()));
+            self.activity = "WSL distribution selected for new sessions".into();
+            cx.notify();
+            return;
+        }
         let Some(host) = self.hosts.iter().find(|host| host.id == id) else {
             return;
         };
@@ -3203,6 +3222,17 @@ impl UtilitySurfaces {
                 }),
             )
             .child(pane)
+            // Settings fills the title row beside the sidebar, so the window
+            // drags from its empty band.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(Metrics::TITLE_BAR))
+                    .titlebar_drag_area(),
+            )
             .child(notification_titlebar_button(unread, colors))
             .when_some(self.nested_root.as_ref(), |shell, prompt| {
                 let parent = prompt.parent.clone();
@@ -3381,7 +3411,10 @@ impl UtilitySurfaces {
                             .flex()
                             .flex_col()
                             .gap(px(10.0))
-                            .child(t("settings.phone.step_iphone_detail"))
+                            .child(tf(
+                                "settings.phone.step_iphone_detail",
+                                &[("machine", &crate::platform::local_machine_label_lowercase())],
+                            ))
                             .child(t("settings.phone.no_advanced"))
                             .child(settings_primary_button(
                                 t("settings.phone.enable"),
@@ -5865,7 +5898,11 @@ impl UtilitySurfaces {
                         .child(appearance_divider(colors))
                         .child(toggle_row(
                             t("settings.appearance.click_links"),
-                            t("settings.appearance.click_links_detail"),
+                            if cfg!(target_os = "macos") {
+                                t("settings.appearance.click_links_detail")
+                            } else {
+                                t("settings.appearance.click_links_detail_ctrl")
+                            },
                             self.prefs.terminal_open_links_on_click,
                             "terminal_open_links_on_click",
                             colors,
@@ -6084,7 +6121,10 @@ impl UtilitySurfaces {
                 }
                 let id = host.id.clone();
                 let name = host.display_name().to_owned();
-                let destination = host.ssh.clone();
+                let destination = host
+                    .wsl_distribution()
+                    .map(|d| format!("WSL · {d}"))
+                    .unwrap_or_else(|| host.ssh.clone());
                 let folder = host.default_cwd.clone();
                 let first_party = host.node.is_some();
                 let is_default = default_host.as_deref() == Some(host.id.as_str());
@@ -7032,7 +7072,8 @@ impl UtilitySurfaces {
 }
 
 fn build_diagnostics_report(store: &SessionStore) -> String {
-    let home = std::env::var_os("HOME")
+    let home = diri_platform::home_dir()
+        .map(|p| p.into_os_string())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/nonexistent"));
     let platform = crate::diagnostics::PlatformMetadata::current();
@@ -7073,6 +7114,12 @@ impl Focusable for UtilitySurfaces {
 impl Render for UtilitySurfaces {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf_overlay::rendered("settings");
+        self.hosts = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .hosts()
+            .to_vec();
         self.release_retired_share_images(window, cx);
         // Every surface or tab change notifies, so this render sees it.
         self.remote_usage_viewer.set_viewing(
@@ -8081,7 +8128,7 @@ fn notification_titlebar_button(unread: usize, colors: SemanticColors) -> AnyEle
         .debug_selector(|| "notification-inbox-button".into())
         .absolute()
         .top(px(7.0))
-        .right(px(14.0))
+        .right(px(14.0 + crate::window_chrome::caption_lane()))
         .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
         .flex()
         .items_center()
@@ -8993,7 +9040,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[cfg(target_os = "macos")]
     use gpui::HeadlessAppContext;
     use gpui::{
         Entity, Modifiers, MouseDownEvent, ScrollDelta, ScrollWheelEvent, StyleRefinement,
@@ -9561,6 +9607,95 @@ mod tests {
         ));
     }
 
+    /// Transcript writes refresh usage every few seconds while an agent
+    /// works. A refresh that only advances the clock within the hour must not
+    /// redraw the Usage page or the sidebar; the hour, new usage and a new
+    /// selection must reach the page's cached report.
+    #[gpui::test]
+    fn clock_only_usage_refreshes_do_not_redraw(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let (surfaces, sidebar) =
+            harness.read_with(cx, |harness, _| (harness.surfaces.clone(), harness.sidebar.clone()));
+        let now = 1_788_523_200;
+        let history = Arc::new(usage_fixture_history(now));
+        let snapshot = |updated_at: i64, history: &Arc<crate::usage::dashboard::UsageHistory>| {
+            crate::usage::UsageSnapshot {
+                updated_at,
+                history: Arc::clone(history),
+                ..Default::default()
+            }
+        };
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Usage, cx);
+            surfaces.set_usage(snapshot(now, &history), cx);
+        });
+        sidebar.update(cx, |sidebar, cx| sidebar.set_usage(snapshot(now, &history), cx));
+        cx.run_until_parked();
+        let page_notifies = Rc::new(Cell::new(0));
+        let sidebar_notifies = Rc::new(Cell::new(0));
+        let _observers = cx.update(|_, cx| {
+            let page = Rc::clone(&page_notifies);
+            let side = Rc::clone(&sidebar_notifies);
+            [
+                cx.observe(&surfaces, move |_, _| page.set(page.get() + 1)),
+                cx.observe(&sidebar, move |_, _| side.set(side.get() + 1)),
+            ]
+        });
+        let refresh = |cx: &mut gpui::VisualTestContext, usage: crate::usage::UsageSnapshot| {
+            surfaces.update(cx, |surfaces, cx| surfaces.set_usage(usage.clone(), cx));
+            sidebar.update(cx, |sidebar, cx| sidebar.set_usage(usage, cx));
+            cx.run_until_parked();
+        };
+        let total = |cx: &mut gpui::VisualTestContext| {
+            surfaces.read_with(cx, |surfaces, _| {
+                surfaces.usage_compare().current.total.totals().total_tokens()
+            })
+        };
+        let before = total(cx);
+
+        refresh(cx, snapshot(now + 600, &history));
+        assert_eq!(page_notifies.get(), 0, "clock-only refresh redrew the page");
+        assert_eq!(sidebar_notifies.get(), 0, "clock-only refresh redrew the sidebar");
+
+        refresh(cx, snapshot(now + 3_600, &history));
+        assert_eq!(page_notifies.get(), 1, "a new hour moves the report window");
+
+        let mut more = (*history).clone();
+        let mut models = crate::usage::dashboard::ModelHours::default();
+        crate::usage::dashboard::record(
+            &mut models,
+            "claude-opus-4-6",
+            (now + 3_600) / 3_600,
+            crate::usage::UsageHourAgg {
+                i: 1_000,
+                o: 0,
+                cr: 0,
+                cw: 0,
+                c: 1.0,
+            },
+            diri_usage::match_claude("claude-opus-4-6"),
+            0,
+        );
+        more.merge(crate::usage::UsageProvider::Claude, &models);
+        refresh(cx, snapshot(now + 3_610, &Arc::new(more)));
+        assert_eq!(page_notifies.get(), 2, "new usage redraws the page");
+        assert_eq!(sidebar_notifies.get(), 1, "new usage redraws the sidebar");
+        assert_eq!(total(cx), before + 1_000, "the cached report follows new usage");
+
+        surfaces.update(cx, |surfaces, _| surfaces.usage_days = 7);
+        let expected = surfaces.read_with(cx, |surfaces, _| {
+            surfaces
+                .usage
+                .history_for_source(None)
+                .compare(now + 3_610, 7)
+                .current
+                .total
+                .totals()
+                .total_tokens()
+        });
+        assert_eq!(total(cx), expected, "the cached report follows the range");
+    }
+
     #[gpui::test]
     fn usage_settings_controls_and_search(cx: &mut TestAppContext) {
         let (harness, cx) = open_settings_workbench(cx);
@@ -9789,6 +9924,220 @@ mod tests {
         });
     }
 
+    /// Two Claude models and Codex over 60 days, ending at `now`: the fixture
+    /// for the Usage page's screenshot and frame benchmark.
+    fn usage_fixture_history(now: i64) -> crate::usage::dashboard::UsageHistory {
+    let mut history = crate::usage::dashboard::UsageHistory::default();
+    let mut models = crate::usage::dashboard::ModelHours::default();
+    let today = now / 86_400;
+    for day in 0..60 {
+        if day % 5 == 0 {
+            continue;
+        }
+        for (index, model) in ["claude-opus-4-6", "claude-sonnet-4-6"]
+            .into_iter()
+            .enumerate()
+        {
+            let volume = ((day * 7 + index * 11) % 19 + 1) as i64;
+            crate::usage::dashboard::record(
+                &mut models,
+                model,
+                (today - day as i64) * 24,
+                crate::usage::UsageHourAgg {
+                    i: volume * 1000,
+                    o: volume * 10_000,
+                    cr: volume * 1_000_000,
+                    cw: volume * 100_000,
+                    c: volume as f64 * 0.9,
+                },
+                diri_usage::match_claude(model),
+                0,
+            );
+        }
+    }
+    history.merge(crate::usage::UsageProvider::Claude, &models);
+    models.clear();
+    for day in 0..60 {
+        let volume = (day * 3) % 13 + 1;
+        crate::usage::dashboard::record(
+            &mut models,
+            "gpt-5.4",
+            (today - day) * 24,
+            crate::usage::UsageHourAgg {
+                i: volume * 2000,
+                o: volume * 8000,
+                cr: volume * 200_000,
+                cw: 0,
+                c: volume as f64 * 0.3,
+            },
+            diri_usage::match_openai("gpt-5.4"),
+            volume * 3000,
+        );
+    }
+    history.merge(crate::usage::UsageProvider::Codex, &models);
+        history
+    }
+
+    /// Frame cost of the Usage page with the platform text system: refreshes
+    /// that only advance the snapshot clock, a pointer scrubbing the chart,
+    /// and range changes. Run with
+    /// `cargo test --release -p diri-app --bin diri usage_page_frame_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark: prints Usage page frame costs"]
+    fn usage_page_frame_costs() {
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| crate::fonts::init(cx));
+        let now = 1_788_523_200;
+        let window = cx
+            .open_window(size(px(1200.0), px(900.0)), move |window, cx| {
+                let harness =
+                    cx.new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Usage, window, cx));
+                harness.update(cx, |harness, cx| {
+                    harness.surfaces.update(cx, |surfaces, cx| {
+                        surfaces.set_usage(
+                            crate::usage::UsageSnapshot {
+                                updated_at: now,
+                                history: Arc::new(usage_fixture_history(now)),
+                                ..Default::default()
+                            },
+                            cx,
+                        );
+                    });
+                });
+                harness
+            })
+            .expect("open usage page");
+        cx.run_until_parked();
+        let surfaces = cx.update(|cx| window.read(cx).unwrap().surfaces.clone());
+        let any: gpui::AnyWindowHandle = window.into();
+        let last = |cx: &mut HeadlessAppContext| {
+            cx.update_window(any, |_, window, _| window.last_frame_stats())
+                .unwrap()
+        };
+        let report = |name: &str, steps: usize, frames: &[(Duration, gpui::FrameStats)]| {
+            let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+            let n = frames.len().max(1) as f64;
+            let mean = |f: &dyn Fn(&gpui::FrameStats) -> Duration| {
+                frames.iter().map(|(_, stats)| ms(f(stats))).sum::<f64>() / n
+            };
+            eprintln!(
+                "{name}: steps={steps} frames={} step_ms={:.3} draw_ms={:.3} layout={:.3} prepaint={:.3} paint={:.3} views_rendered={:.1}",
+                frames.len(),
+                frames.iter().map(|(wall, _)| ms(*wall)).sum::<f64>() / n,
+                mean(&|stats| stats.total()),
+                mean(&|stats| stats.layout),
+                mean(&|stats| stats.prepaint),
+                mean(&|stats| stats.paint),
+                frames
+                    .iter()
+                    .map(|(_, stats)| f64::from(stats.views_rendered))
+                    .sum::<f64>()
+                    / n,
+            );
+        };
+        let step = |cx: &mut HeadlessAppContext,
+                    frames: &mut Vec<(Duration, gpui::FrameStats)>,
+                    act: &dyn Fn(&mut Window, &mut App)| {
+            let before = last(cx);
+            let started = std::time::Instant::now();
+            cx.update_window(any, |_, window, cx| act(window, cx))
+                .unwrap();
+            cx.run_until_parked();
+            let elapsed = started.elapsed();
+            let after = last(cx);
+            if after != before {
+                frames.push((elapsed, after));
+            }
+        };
+
+        // A transcript write refreshes usage without changing anything shown.
+        let mut frames = Vec::new();
+        for tick in 1..=40 {
+            let surfaces = surfaces.clone();
+            step(&mut cx, &mut frames, &move |_, cx| {
+                surfaces.update(cx, |surfaces, cx| {
+                    let mut usage = surfaces.usage.clone();
+                    usage.updated_at = now + tick * 5;
+                    surfaces.set_usage(usage, cx);
+                });
+            });
+        }
+        report("clock-only refresh", 40, &frames);
+
+        // Find the chart, then scrub across it.
+        let mut chart = None;
+        'search: for y in (60..700).step_by(20) {
+            for x in (600..1180).step_by(40) {
+                let position = point(px(x as f32), px(y as f32));
+                cx.update_window(any, |_, window, cx| {
+                    window.dispatch_event(
+                        gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                            position,
+                            pressed_button: None,
+                            modifiers: Modifiers::default(),
+                        }),
+                        cx,
+                    );
+                })
+                .unwrap();
+                cx.run_until_parked();
+                if cx.update(|cx| surfaces.read(cx).usage_scrub.is_some()) {
+                    chart = Some((x as f32, y as f32));
+                    break 'search;
+                }
+            }
+        }
+        let (chart_x, chart_y) = chart.expect("usage chart under the pointer");
+        let mut frames = Vec::new();
+        for index in 0..120 {
+            let position = point(
+                px(chart_x + (index % 40) as f32 * 4.0),
+                px(chart_y + 10.0),
+            );
+            step(&mut cx, &mut frames, &move |window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                        position,
+                        pressed_button: None,
+                        modifiers: Modifiers::default(),
+                    }),
+                    cx,
+                );
+            });
+        }
+        report("chart scrub", 120, &frames);
+        cx.update_window(any, |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                    position: point(px(5.0), px(890.0)),
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        // Range changes: the first frame at each range.
+        let mut frames = Vec::new();
+        for days in [7, 30, 90, 1].repeat(5) {
+            let surfaces = surfaces.clone();
+            step(&mut cx, &mut frames, &move |_, cx| {
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.usage_days = days;
+                    cx.notify();
+                });
+            });
+        }
+        report("range change", 20, &frames);
+    }
+
     /// Deterministic local working hours for the last 26 weeks.
     #[cfg(target_os = "macos")]
     fn seed_usage_activity(history: &mut crate::usage::dashboard::UsageHistory, now: i64) {
@@ -9884,55 +10233,8 @@ mod tests {
                     cx.new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Usage, window, cx));
                 harness.update(cx, |harness, cx| {
                     harness.surfaces.update(cx, |surfaces, cx| {
-                        let mut history = crate::usage::dashboard::UsageHistory::default();
-                        let mut models = crate::usage::dashboard::ModelHours::default();
                         let now = 1_788_523_200;
-                        let today = now / 86_400;
-                        for day in 0..60 {
-                            if day % 5 == 0 {
-                                continue;
-                            }
-                            for (index, model) in ["claude-opus-4-6", "claude-sonnet-4-6"]
-                                .into_iter()
-                                .enumerate()
-                            {
-                                let volume = ((day * 7 + index * 11) % 19 + 1) as i64;
-                                crate::usage::dashboard::record(
-                                    &mut models,
-                                    model,
-                                    (today - day as i64) * 24,
-                                    crate::usage::UsageHourAgg {
-                                        i: volume * 1000,
-                                        o: volume * 10_000,
-                                        cr: volume * 1_000_000,
-                                        cw: volume * 100_000,
-                                        c: volume as f64 * 0.9,
-                                    },
-                                    diri_usage::match_claude(model),
-                                    0,
-                                );
-                            }
-                        }
-                        history.merge(crate::usage::UsageProvider::Claude, &models);
-                        models.clear();
-                        for day in 0..60 {
-                            let volume = (day * 3) % 13 + 1;
-                            crate::usage::dashboard::record(
-                                &mut models,
-                                "gpt-5.4",
-                                (today - day) * 24,
-                                crate::usage::UsageHourAgg {
-                                    i: volume * 2000,
-                                    o: volume * 8000,
-                                    cr: volume * 200_000,
-                                    cw: 0,
-                                    c: volume as f64 * 0.3,
-                                },
-                                diri_usage::match_openai("gpt-5.4"),
-                                volume * 3000,
-                            );
-                        }
-                        history.merge(crate::usage::UsageProvider::Codex, &models);
+                        let mut history = usage_fixture_history(now);
                         // `DIRI_VISUAL_ACTIVITY` adds half a year of working
                         // hours (weekdays, a quiet fortnight, late nights) so
                         // the activity calendar and rhythm have shape.
@@ -10625,6 +10927,7 @@ mod tests {
             let surfaces = cx.new(|cx| {
                 let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
                 let host = HostEntry {
+                    transport: Default::default(),
                     id: "forge".into(),
                     name: Some("Forge".into()),
                     ssh: "you@forge".into(),
@@ -10690,6 +10993,7 @@ mod tests {
             let surfaces = cx.new(|cx| {
                 let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
                 surfaces.hosts = vec![HostEntry {
+                    transport: Default::default(),
                     id: "forge".into(),
                     name: Some("Forge".into()),
                     ssh: "you@forge".into(),

@@ -261,10 +261,10 @@ impl UtilitySurfaces {
                 ))
                 .child(setting_divider(colors))
                 .child(setting_row(
-                    t("settings.privacy.local"),
+                    tf("settings.privacy.local", &[("machine", &crate::platform::local_machine_label_lowercase())]),
                     t("settings.privacy.local_detail"),
                     surface_button(
-                        t("settings.privacy.show_in_finder"),
+                        crate::platform::reveal_in_file_manager_label(),
                         "show-diagnostics-folder",
                         colors,
                         cx,

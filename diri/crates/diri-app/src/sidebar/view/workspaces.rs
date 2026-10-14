@@ -576,7 +576,8 @@ impl Sidebar {
                 .flex_1()
                 .min_w(px(0.0))
                 .overflow_x_scroll()
-                .track_scroll(&self.workspace_nav.scroll);
+                .track_scroll(&self.workspace_nav.scroll)
+                .titlebar_drag_area();
         } else {
             rows = rows
                 .flex_col()
@@ -1369,6 +1370,7 @@ impl Sidebar {
                     this.track_lift_pointer(event.event.position, cx);
                 },
             ))
+            .titlebar_drag_area()
             .h(px(self.tab_strip_height()))
             .w_full()
             .flex_none()
@@ -1381,7 +1383,7 @@ impl Sidebar {
             .pb(px(6.0))
             .gap(px(0.0))
             .pl(px(self.strip_leading_inset()))
-            .pr(px(10.0))
+            .pr(px(10.0 + self.strip_caption_inset))
             // Comfortable: the island below is the edge, so no hairline.
             .when(!self.islands(), |strip| {
                 strip.child(
@@ -1396,6 +1398,15 @@ impl Sidebar {
             })
             // Islands already paint this chrome; a second tint would darken it.
             .when(!self.islands(), |strip| strip.bg(colors.sidebar_surface()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    // Content only: the strip's own fill keeps its color.
+                    .opacity(self.title_opacity)
             .child(
                 // A breath between the project control and the first tab.
                 div()
@@ -1420,6 +1431,7 @@ impl Sidebar {
                         this.open_header_new_agent(event.position(), window, cx);
                         cx.stop_propagation();
                     })),
+            )
             )
             .when_some(trailing, |strip, trailing| {
                 strip.child(

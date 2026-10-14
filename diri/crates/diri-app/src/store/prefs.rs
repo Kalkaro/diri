@@ -648,7 +648,8 @@ impl Prefs {
     pub const MAX_TERMINAL_LINE_HEIGHT: f32 = 2.0;
 
     pub fn path() -> PathBuf {
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         Self::path_in_home(&home)

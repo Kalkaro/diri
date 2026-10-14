@@ -28,6 +28,10 @@ pub mod install;
 pub mod mirror;
 pub mod net;
 pub mod version;
+#[cfg(windows)]
+mod windows;
+#[cfg(any(windows, test))]
+mod windows_identity;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -164,6 +168,11 @@ pub struct UpdaterConfig {
 }
 
 impl UpdaterConfig {
+    #[cfg(windows)]
+    pub fn for_running_app(current_version: &str) -> Result<Self> {
+        windows::running_config(current_version)
+    }
+
     /// Builds the configuration for the running app, or explains why this
     /// build cannot update itself.
     ///
@@ -171,6 +180,7 @@ impl UpdaterConfig {
     /// Info.plist so the app and the updater agree on one source of truth —
     /// `CARGO_PKG_VERSION`, which is also what cargo-packager stamps into the
     /// plist at package time.
+    #[cfg(not(windows))]
     pub fn for_running_app(current_version: &str) -> Result<Self> {
         let bundle = bundle::running_bundle().ok_or_else(|| {
             UpdateError::NotUpdatable("diri is not running from an app bundle".to_owned())
@@ -186,7 +196,8 @@ impl UpdaterConfig {
             ));
         }
 
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .ok_or_else(|| UpdateError::NotUpdatable("HOME is unset".to_owned()))?;
         let feed_override = std::env::var(FEED_URL_ENV).ok();
@@ -511,6 +522,7 @@ impl Updater {
 }
 
 /// Reads `CFBundleShortVersionString` out of a staged bundle's Info.plist.
+#[cfg(not(windows))]
 fn verify_staged_version(app: &Path, release: &Release) -> Result<()> {
     let output = std::process::Command::new("/usr/bin/defaults")
         .arg("read")
@@ -539,6 +551,11 @@ fn staged_version_matches(found: &str, release: &Release) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn verify_staged_version(app: &Path, release: &Release) -> Result<()> {
+    windows::verify_version(app, release)
 }
 
 // Real curl against local HTTPS servers via the system `openssl`.
@@ -702,14 +719,14 @@ mod tests {
         assert_eq!(staged.release.version, release.version);
         for executable in ["dirijord-rs", "diri-holder"] {
             let path = staged.app.join("Contents/Resources/bin").join(executable);
-            let metadata = std::fs::metadata(&path).unwrap_or_else(|error| {
+            let _metadata = std::fs::metadata(&path).unwrap_or_else(|error| {
                 panic!("published bundle is missing {}: {error}", path.display())
             });
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
                 assert_ne!(
-                    metadata.permissions().mode() & 0o111,
+                    _metadata.permissions().mode() & 0o111,
                     0,
                     "published helper is not executable: {}",
                     path.display()

@@ -101,7 +101,10 @@ impl TerminalPane {
                 if root.is_dir() {
                     Ok(path_picker::scan(&root))
                 } else {
-                    Err(tf("terminal.path.not_folder", &[("path", &root.display())]))
+                    Err(tf(
+                        "terminal.path.not_folder",
+                        &[("path", &root.display()), ("machine", &crate::platform::local_machine_label_lowercase())],
+                    ))
                 }
             })
             .await
@@ -270,7 +273,8 @@ impl TerminalPane {
         let placeholder = picker.root().map_or_else(
             || t("terminal.path.finding").to_owned(),
             |root| {
-                let home = std::env::var_os("HOME")
+                let home = diri_platform::home_dir()
+                    .map(|p| p.into_os_string())
                     .map(PathBuf::from)
                     .unwrap_or_default();
                 crate::quick_open::collapse_home(root, &home)

@@ -62,6 +62,7 @@ use crate::store::{
 };
 use crate::switcher::display_title;
 use crate::updates::{UpdateCommand, UpdatePhase, UpdateState};
+use crate::window_chrome::TitlebarDragArea;
 use crate::usage::{UsageFormat, UsageSnapshot};
 
 use crate::session_presentation::{activity_mark, is_loading, status_state, ui_agent_kind};
@@ -703,6 +704,12 @@ pub struct Sidebar {
     /// Hold-⌘ hint opacity for the horizontal strip, which `RootView`
     /// renders inline and so samples for it.
     pub(crate) strip_held_hint: f32,
+    /// Room the horizontal strip leaves at its trailing edge for the window's
+    /// caption buttons, set by RootView, which paints the strip inline.
+    pub(crate) strip_caption_inset: f32,
+    /// The title row's opacity this frame (`window_chrome::title_row_opacity`),
+    /// set by whoever renders the sidebar's title-row chrome.
+    pub(crate) title_opacity: f32,
     preview: bool,
     /// Which face the New Agent menu shows. The remote directory listing
     /// itself lives in the Store so the daemon adapter can complete it
@@ -902,6 +909,8 @@ impl Sidebar {
             hues: Default::default(),
             shortcut_ranks: HashMap::new(),
             strip_held_hint: 0.0,
+            strip_caption_inset: 0.0,
+            title_opacity: 1.0,
             lineage_roles: HashMap::new(),
             focus_handle: cx.focus_handle(),
             hover_task: None,
@@ -1089,8 +1098,18 @@ impl Sidebar {
         {
             cx.emit(SidebarEvent::RefreshUsageLimits);
         }
+        // Most refreshes only advance `updated_at`, which the sidebar does not
+        // show; redrawing for them costs a frame every few seconds.
+        let changed = self.usage.as_ref().is_none_or(|usage| {
+            UsageSnapshot {
+                updated_at: snapshot.updated_at,
+                ..usage.clone()
+            } != snapshot
+        });
         self.usage = Some(snapshot);
-        cx.notify();
+        if changed {
+            cx.notify();
+        }
     }
 
     pub fn pending_close_copy(&self) -> Option<(String, String)> {
@@ -2141,6 +2160,8 @@ impl Sidebar {
             )
         };
         div()
+            .titlebar_drag_area()
+            .opacity(self.title_opacity)
             .h(px(Metrics::TITLE_BAR))
             .flex_none()
             .flex()
@@ -3952,11 +3973,11 @@ impl Sidebar {
                         .sidebar_click(
                             row_session.id.clone(),
                             ClickModifiers {
-                                command: modifiers.platform,
+                                command: crate::platform::shortcut_modifier(&modifiers),
                                 shift: modifiers.shift,
                             },
                         );
-                    if !modifiers.platform && !modifiers.shift {
+                    if !crate::platform::shortcut_modifier(&modifiers) && !modifiers.shift {
                         cx.emit(SidebarEvent::SessionActivated);
                     }
                     cx.notify();
@@ -4508,11 +4529,11 @@ impl Sidebar {
                     .sidebar_click(
                         row_session.id.clone(),
                         ClickModifiers {
-                            command: modifiers.platform,
+                            command: crate::platform::shortcut_modifier(&modifiers),
                             shift: modifiers.shift,
                         },
                     );
-                if !modifiers.platform && !modifiers.shift {
+                if !crate::platform::shortcut_modifier(&modifiers) && !modifiers.shift {
                     cx.emit(SidebarEvent::SessionActivated);
                 }
                 cx.notify();
@@ -7505,7 +7526,7 @@ impl Sidebar {
                     // The press was a click until the pointer wandered past
                     // the threshold. Finish it as one: select, activate.
                     let modifiers = window.modifiers();
-                    if !modifiers.platform && !modifiers.shift {
+                    if !crate::platform::shortcut_modifier(&modifiers) && !modifiers.shift {
                         self.ui.focus_cursor = Some(target.clone());
                         self.store
                             .write()
@@ -8220,7 +8241,12 @@ fn local_day_ordinal(timestamp_ms: f64) -> Option<i64> {
     // a null pointer. No returned pointer escapes this function.
     let local = unsafe {
         let mut local = std::mem::zeroed::<libc::tm>();
+        #[cfg(unix)]
         if libc::localtime_r(&timestamp, &mut local).is_null() {
+            return None;
+        }
+        #[cfg(windows)]
+        if libc::localtime_s(&mut local, &timestamp) != 0 {
             return None;
         }
         local
@@ -8757,7 +8783,10 @@ impl Sidebar {
                     cx.notify();
                 }
             }))
-            .child(self.top_bar(crate::held_hints::opacity(window, cx), colors, cx));
+            .child({
+                self.title_opacity = crate::window_chrome::title_row_opacity(window);
+                self.top_bar(crate::held_hints::opacity(window, cx), colors, cx)
+            });
         if let Some(nav) = self.settings_nav.clone() {
             root = root.child(self.settings_body(&nav, colors, cx));
         } else {
@@ -10118,7 +10147,16 @@ mod tests {
                 local.tm_hour = hour;
                 local.tm_min = minute;
                 local.tm_isdst = -1;
-                libc::mktime(&mut local)
+                #[cfg(unix)]
+                let seconds = libc::mktime(&mut local);
+                #[cfg(windows)]
+                let seconds = {
+                    unsafe extern "C" {
+                        fn _mktime64(local: *mut libc::tm) -> i64;
+                    }
+                    _mktime64(&mut local)
+                };
+                seconds
             };
             assert_ne!(seconds, -1);
             seconds as f64 * 1_000.0
@@ -12741,6 +12779,7 @@ mod tests {
                                     &[("claude-code", "Claude Code"), ("codex", "Codex")],
                                 ));
                                 store.set_hosts(vec![diri_proto::HostEntry {
+                                    transport: Default::default(),
                                     id: "forge".into(),
                                     name: Some("Forge".into()),
                                     ssh: "you@forge".into(),
@@ -13591,6 +13630,7 @@ mod tests {
                     .write()
                     .expect("session store lock poisoned")
                     .set_hosts(vec![diri_proto::HostEntry {
+                        transport: Default::default(),
                         id: "forge".into(),
                         name: Some("Forge".into()),
                         ssh: "you@forge".into(),
@@ -13666,6 +13706,7 @@ mod tests {
                 .write()
                 .expect("session store lock poisoned")
                 .set_hosts(vec![diri_proto::HostEntry {
+                    transport: Default::default(),
                     id: "forge".into(),
                     name: Some("Forge".into()),
                     ssh: "you@forge".into(),
@@ -13801,6 +13842,7 @@ mod tests {
                     .write()
                     .expect("session store lock poisoned")
                     .set_hosts(vec![diri_proto::HostEntry {
+                        transport: Default::default(),
                         id: "forge".into(),
                         name: Some("Forge".into()),
                         ssh: "you@forge".into(),
@@ -13854,6 +13896,7 @@ mod tests {
                 {
                     let mut store = sidebar.store.write().expect("session store lock poisoned");
                     store.set_hosts(vec![diri_proto::HostEntry {
+                        transport: Default::default(),
                         id: "forge".into(),
                         name: Some("Forge".into()),
                         ssh: "you@forge".into(),

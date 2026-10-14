@@ -39,17 +39,21 @@ pub mod client;
 pub mod frozen_orphans;
 #[cfg(unix)]
 pub mod guard;
+#[cfg_attr(windows, path = "holder/windows/launcher.rs")]
 pub mod launcher;
+#[cfg(unix)]
 pub mod manager;
 pub mod paths;
+#[cfg_attr(windows, path = "holder/windows/process_tree.rs")]
 pub mod process_tree;
 pub mod protocol;
 mod socket;
 
-#[cfg(unix)]
+#[cfg_attr(windows, path = "holder/windows/server.rs")]
 pub mod server;
 
 mod fanout;
+#[cfg(unix)]
 mod log_feed;
 
 pub use client::{HolderClient, HolderManagerClient, HolderOutputStream};
@@ -76,7 +80,6 @@ pub use protocol::{
 
 #[cfg(unix)]
 pub use manager::HolderManagerServer;
-#[cfg(unix)]
 pub use server::HolderServer;
 
 /// Failures across the local holder seam.

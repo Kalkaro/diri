@@ -321,7 +321,7 @@ impl Sidebar {
     /// strip shares the traffic lights' row, and its first control sits just
     /// past the lights, at the same window x in either density.
     pub(super) fn strip_leading_inset(&self) -> f32 {
-        if cfg!(target_os = "macos") && !self.ui.visible {
+        if crate::window_chrome::traffic_lights_visible() && !self.ui.visible {
             let gap = self
                 .store
                 .read()
@@ -440,7 +440,10 @@ impl Sidebar {
             .min_w(px(0.0))
             .h(px(30.0))
             .overflow_x_scroll()
-            .track_scroll(&self.tab_scroll);
+            .track_scroll(&self.tab_scroll)
+            // The scroller's hitbox covers the gaps between tabs; those move
+            // the window like the rest of the strip.
+            .titlebar_drag_area();
         if self.last_tab_selection != selected || self.last_tab_available_width != available_width {
             if let Some(index) = tabs
                 .sessions
@@ -984,6 +987,7 @@ impl Sidebar {
             ))
             .role(Role::TabList)
             .aria_label(t("sidebar.tabs.project_sessions"))
+            .titlebar_drag_area()
             .flex_none()
             .h(px(self.tab_strip_height()))
             .w_full()
@@ -996,7 +1000,7 @@ impl Sidebar {
             .pb(px(6.0))
             .gap(px(0.0))
             .pl(px(self.strip_leading_inset()))
-            .pr(px(10.0))
+            .pr(px(10.0 + self.strip_caption_inset))
             // Comfortable: the island below is the edge, so no hairline.
             .when(!self.islands(), |strip| {
                 strip.child(
@@ -1012,6 +1016,15 @@ impl Sidebar {
             // Islands already paint this chrome; a second tint would darken it.
             .when(!self.islands(), |strip| strip.bg(colors.sidebar_surface()))
             .text_color(colors.primary)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    // Content only: the strip's own fill keeps its color.
+                    .opacity(self.title_opacity)
             .child(
                 // A breath between the project control and the first tab.
                 div()
@@ -1079,7 +1092,7 @@ impl Sidebar {
                         .items_center()
                         .child(trailing),
                 )
-            })
+            }))
             .into_any_element()
     }
 }

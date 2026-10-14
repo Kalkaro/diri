@@ -255,7 +255,9 @@ impl Registry {
     /// ignored: treating it as a fresh install would make the next write
     /// overwrite every session record the user had.
     pub fn load(&mut self) -> std::io::Result<usize> {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
+            .map(PathBuf::from);
         self.load_with_home(home.as_deref())
     }
 
@@ -1008,7 +1010,7 @@ impl Registry {
                     continue;
                 }
                 let mut recovered = recovered_record(capsule);
-                if let Some(home) = std::env::var_os("HOME") {
+                if let Some(home) = diri_platform::home_dir().map(|p| p.into_os_string()) {
                     repair_codex_conversation(&mut recovered, Path::new(&home));
                 }
                 self.ensure_session_project(&recovered.cwd, None);
@@ -1054,7 +1056,10 @@ impl Registry {
                             || seed.occurred_at_ms as f64 >= record_updated_at)
                         && let Some((signal, metadata)) = crate::hooks::parse_activity_seed(&seed)
                     {
-                        let home = std::env::var("HOME").ok();
+                        let home = diri_platform::home_dir()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .ok_or(std::env::VarError::NotPresent)
+                            .ok();
                         let accepted = self
                             .accept_hook_metadata(
                                 &session_id,
@@ -1623,7 +1628,7 @@ impl Registry {
             .is_some_and(|record| record.hibernation.is_some())
             || self.sessions.get(id).is_some_and(Session::is_hibernated);
         if let Some(session) = self.sessions.get(id) {
-            session.signal_tree(libc::SIGCONT)?;
+            session.signal_tree(diri_platform::signals::SIGCONT)?;
             // Flush AFTER the CONT so the tree is drinking again.
             let _ = session.set_hibernated(false);
         }
@@ -1654,7 +1659,10 @@ impl Registry {
         signal: StatusSignal,
         meta: &crate::hooks::HookMetadata,
     ) -> bool {
-        let home = std::env::var("HOME").ok();
+        let home = diri_platform::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or(std::env::VarError::NotPresent)
+            .ok();
         let Some(changed) = self.accept_hook_metadata(id, meta, home.as_deref().map(Path::new))
         else {
             return false;
@@ -1671,7 +1679,10 @@ impl Registry {
     /// and the provider's native conversation title when it becomes available.
     /// Returns whether anything changed.
     pub fn apply_hook_metadata(&mut self, id: &str, meta: &crate::hooks::HookMetadata) -> bool {
-        let Ok(home) = std::env::var("HOME") else {
+        let Ok(home) = diri_platform::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or(std::env::VarError::NotPresent)
+        else {
             return self.apply_hook_metadata_with_home(id, meta, None);
         };
         self.apply_hook_metadata_with_home(id, meta, Some(Path::new(&home)))
@@ -1897,7 +1908,7 @@ impl Registry {
     ) -> std::io::Result<()> {
         let tree = {
             let session = self.sessions.get(id).ok_or_else(|| not_found(id))?;
-            let tree = session.signal_tree(libc::SIGSTOP)?;
+            let tree = session.signal_tree(diri_platform::signals::SIGSTOP)?;
             let _ = session.set_hibernated(true);
             tree
         };
@@ -2388,7 +2399,9 @@ fn predates_boot(record: &SessionRecord, boot: DateMillis) -> bool {
 }
 
 fn user_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    diri_platform::home_dir()
+        .map(|p| p.into_os_string())
+        .map(PathBuf::from)
 }
 
 pub(crate) fn scan_cursor_refreshes(
@@ -3153,14 +3166,7 @@ impl CompletedRunHandle {
 }
 
 fn ensure_private_dir(directory: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    match std::fs::DirBuilder::new().mode(0o700).create(directory) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
-        }
-        Err(error) => Err(error),
-    }
+    diri_platform::security::private_dir_all(directory)
 }
 
 fn not_found(id: &str) -> std::io::Error {
@@ -4223,6 +4229,7 @@ mod tests {
         assert_eq!(record.title, "Performance pass");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_tab_never_takes_a_conversation_another_live_tab_holds() {
         let temp = tempfile::tempdir().expect("temp");
@@ -4269,6 +4276,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_subagent_notify_does_not_replace_the_parent_conversation() {
         let temp = tempfile::tempdir().unwrap();
@@ -4367,6 +4375,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_notify_keeps_its_thread_when_codex_spells_the_cwd_differently() {
         let temp = tempfile::tempdir().expect("temp");
@@ -4993,6 +5002,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_provider_prompt_refresh_stays_consistent_with_live_records() {
         let temp = tempfile::tempdir().unwrap();
@@ -5178,6 +5188,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_terminal_input_names_a_session_before_the_first_idle_observation() {
         let temp = tempfile::tempdir().unwrap();
@@ -5231,6 +5242,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn quiet_natural_exit_reaches_disk_without_a_title_or_turn_change() {
         // A shell command that exits without ever changing its title or
@@ -5319,6 +5331,7 @@ mod tests {
             .ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_pty_names_update_even_after_the_first_prompt_was_captured() {
         let temp = tempfile::tempdir().unwrap();
@@ -5438,6 +5451,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_prompt_titles_stay_stable_across_native_refresh_and_live_views() {
         for resumed in [false, true] {
@@ -5854,6 +5868,7 @@ mod tests {
 
     /// A `cd` is written to disk even when it does not rename the tab: a
     /// renamed terminal, or two directories with the same last component.
+    #[cfg(unix)]
     #[test]
     fn a_cd_reaches_the_state_file_without_a_new_title() {
         let temp = tempfile::tempdir().expect("temp");

@@ -27,6 +27,7 @@ use gpui::{
 };
 
 use crate::code_viewer::CodeViewer;
+use crate::window_chrome::TitlebarDragArea as _;
 use crate::details_ui;
 use crate::diff::{
     DiffLayer, DiffSelection, DiffSnapshot, load_commit_diff, load_local_diff,
@@ -424,6 +425,8 @@ pub struct WorkbenchInspector {
     refresh_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
     _store_changes: Task<()>,
+    /// This frame's title-row opacity (`window_chrome::title_row_opacity`).
+    title_opacity: f32,
 }
 
 impl EventEmitter<InspectorEvent> for WorkbenchInspector {}
@@ -545,7 +548,8 @@ impl WorkbenchInspector {
             transcript_version: None,
             transcript_generation: 0,
             transcript_task: None,
-            transcript_home: std::env::var_os("HOME")
+            transcript_home: diri_platform::home_dir()
+                .map(|p| p.into_os_string())
                 .map(PathBuf::from)
                 .unwrap_or_default(),
             review_action_task: None,
@@ -578,6 +582,7 @@ impl WorkbenchInspector {
             refresh_task: None,
             poll_task: None,
             _store_changes: store_changes,
+            title_opacity: 1.0,
         }
     }
 
@@ -2257,10 +2262,17 @@ impl WorkbenchInspector {
             );
         }
 
+        // The inspector reaches the window's top-right corner, so its title
+        // bar makes room for the caption buttons where diri draws them.
         div()
+            .titlebar_drag_area()
+            .opacity(self.title_opacity)
             .h(px(40.0))
             .flex_none()
-            .px(px(details_ui::CONTENT_INSET))
+            .pl(px(details_ui::CONTENT_INSET))
+            .pr(px(
+                details_ui::CONTENT_INSET + crate::window_chrome::caption_lane()
+            ))
             .flex()
             .items_center()
             .child(track)
@@ -2668,11 +2680,15 @@ impl WorkbenchInspector {
         let menu_open = self.workspace_chooser_open;
         div()
             .id("workspace-surface-header")
+            .titlebar_drag_area()
+            .opacity(self.title_opacity)
             .relative()
             .h(px(self.header_height()))
             .flex_none()
             .pl(px(7.0))
-            .pr(px(Metrics::TOOLBAR_EDGE_INSET))
+            .pr(px(
+                Metrics::TOOLBAR_EDGE_INSET + crate::window_chrome::caption_lane()
+            ))
             .flex()
             .items_center()
             .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
@@ -3020,7 +3036,11 @@ impl WorkbenchInspector {
                                     .max_w(px(230.0))
                                     .text_size(px(11.0))
                                     .line_height(px(17.0))
-                                    .child(t("panel.browser.empty_detail")),
+                                    .child(if cfg!(target_os = "macos") {
+                                        t("panel.browser.empty_detail")
+                                    } else {
+                                        t("panel.browser.empty_detail_external")
+                                    }),
                             )
                     })
                     .when_some(self.browser_state.error.clone(), |body, error| {
@@ -6042,6 +6062,7 @@ impl WorkbenchInspector {
 impl Render for WorkbenchInspector {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf_overlay::rendered("inspector");
+        self.title_opacity = crate::window_chrome::title_row_opacity(window);
         let colors = {
             let store = self
                 .runtime

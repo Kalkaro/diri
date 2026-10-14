@@ -145,7 +145,7 @@
   "settings.skills.copy": "拷贝说明",
   "settings.skills.count_one": "{count} 个技能",
   "settings.skills.count_other": "{count} 个技能",
-  "settings.skills.intro": "浏览这台 Mac 和当前本地项目中的技能。",
+  "settings.skills.intro": "浏览{machine} 和当前本地项目中的技能。",
   "settings.skills.looking": "正在查找技能…",
   "settings.skills.no_match": "没有符合这些筛选条件的技能。",
   "settings.skills.none_found": "未找到技能。在智能体的技能目录中添加包含 SKILL.md 的文件夹，然后刷新。",

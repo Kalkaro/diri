@@ -145,7 +145,7 @@
   "settings.skills.copy": "Copy instructions",
   "settings.skills.count_one": "{count} skill",
   "settings.skills.count_other": "{count} skills",
-  "settings.skills.intro": "Browse skills on this Mac and in the current local project.",
+  "settings.skills.intro": "Browse skills on {machine} and in the current local project.",
   "settings.skills.looking": "Looking for skills…",
   "settings.skills.no_match": "No skills match these filters.",
   "settings.skills.none_found": "No skills found. Add a SKILL.md folder to your agent’s skills directory, then refresh.",

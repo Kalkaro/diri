@@ -32,6 +32,7 @@
   "command.equalize_panes.description": "Give every pane of the tab an equal share",
   "command.equalize_panes.palette_title": "Equalize panes",
   "command.equalize_panes.title": "Equalize panes",
+  "command.exit.title": "Exit Diri",
   "command.export_scrollback.description": "Open retained terminal output in your text editor",
   "command.export_scrollback.palette_title": "Open scrollback in editor",
   "command.export_scrollback.title": "Open scrollback in editor",

@@ -71,6 +71,7 @@ use crate::haptics::{self, Haptic};
 use crate::i18n::{t, tf};
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::NavigationOverlay;
+use crate::window_chrome::TitlebarDragArea as _;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::quote::{Quote, QuoteSource};
 use crate::session_surfaces::switcher_key;
@@ -989,6 +990,8 @@ pub struct TerminalPane {
     island_corners: bool,
     /// This frame's hold-⌘ hint opacity, sampled at render.
     held_hint: f32,
+    /// This frame's title-row opacity (`window_chrome::title_row_opacity`).
+    title_opacity: f32,
     /// The workbench hosts this pane's title-bar actions elsewhere (the
     /// horizontal tab strip), so the pane paints no title bar of its own and
     /// the grid takes the reclaimed height.
@@ -1142,6 +1145,10 @@ impl TerminalPane {
             if this.reconcile_secure_input(window) {
                 cx.notify();
             }
+            // The title bar dims with the window on Windows.
+            if crate::window_chrome::draws_caption_buttons() {
+                cx.notify();
+            }
             if window.is_window_active() && this.focus.is_focused(window) {
                 this.claim_selected_control();
                 cx.notify();
@@ -1255,6 +1262,7 @@ impl TerminalPane {
             header_trailing_inset: 0.0,
             island_corners: false,
             held_hint: 0.0,
+            title_opacity: 1.0,
             header_hidden: false,
             navigation: None,
             utility_surfaces: None,
@@ -4399,6 +4407,17 @@ impl TerminalPane {
         }
     }
 
+    /// Room this pane's title bar leaves for the window's caption buttons
+    /// when it reaches the top-right corner of the window (Windows).
+    fn caption_inset(&self) -> f32 {
+        self.viewport.map_or(0.0, |viewport| {
+            crate::window_chrome::caption_inset(
+                viewport.y,
+                f32::from(self.main_viewport.width) - (viewport.x + viewport.width),
+            )
+        })
+    }
+
     /// Holds a geometry change back while a seam is dragged. Every PTY resize
     /// makes a full-screen agent clear and repaint, so a drag that resized
     /// per frame made the pane flash for its whole length. The grid keeps its
@@ -4493,14 +4512,19 @@ impl TerminalPane {
             .gap(px(Metrics::TOOLBAR_ITEM_GAP))
             // The visible lights need more breathing room than their native
             // frames imply, so this is an intentional optical safe area.
-            .when_some(self.window_titlebar_inset(), |control, inset| {
-                // Clear the lights at the same window x in every density.
-                control.child(
-                    div()
-                        .w(px((Metrics::TOOLBAR_TRAFFIC_LIGHT_LANE - inset).max(0.0)))
-                        .flex_none(),
-                )
-            })
+            .when_some(
+                self.window_titlebar_inset()
+                    .filter(|_| crate::window_chrome::leading_lane() > 0.0),
+                |control, inset| {
+                    // Clear the lights (or the Windows icon) at the same
+                    // window x in every density.
+                    control.child(
+                        div()
+                            .w(px((crate::window_chrome::leading_lane() - inset).max(0.0)))
+                            .flex_none(),
+                    )
+                },
+            )
             .child(crate::held_hints::below(
                 div()
                     .id("show-sidebar")
@@ -4554,11 +4578,12 @@ impl TerminalPane {
         let shell_controls = matches!(self.session_source, SessionSource::FollowSelection);
         let show_sidebar = self.shows_navigation_control();
         let sidebar_reveal = show_sidebar.then(|| self.render_sidebar_reveal_control(colors, cx));
-        let header_trailing_inset = self.header_trailing_inset;
+        let header_trailing_inset = self.header_trailing_inset + self.caption_inset();
         let header_width = self
             .viewport
             .map_or(f32::INFINITY, |viewport| viewport.width);
         div()
+            .titlebar_drag_area()
             .h(px(self.title_bar_height()))
             .flex_none()
             .pl(px(Metrics::TOOLBAR_EDGE_INSET))
@@ -4578,6 +4603,7 @@ impl TerminalPane {
                     .items_center()
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
                     .overflow_hidden()
+                    .opacity(self.title_opacity)
                     .when_some(sidebar_reveal, |title, control| title.child(control))
                     .when_some(glyph.filter(|_| header_width >= 280.0), |title, glyph| {
                         title.child(
@@ -4617,6 +4643,7 @@ impl TerminalPane {
                     .flex()
                     .items_center()
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
+                    .opacity(self.title_opacity)
                     .when(shell_controls, |trailing| {
                         trailing
                             .child(self.render_notification_button(colors, self.held_hint))
@@ -5567,6 +5594,7 @@ impl TerminalPane {
         self.update_selected_geometry(window, cx);
         self.main_viewport = window.viewport_size();
         self.held_hint = crate::held_hints::opacity(window, cx);
+        self.title_opacity = crate::window_chrome::title_row_opacity(window);
 
         let selected = self.selected_session();
 
@@ -5643,6 +5671,7 @@ impl TerminalPane {
                 .when(has_header, |pane| {
                     pane.child(
                         div()
+                            .titlebar_drag_area()
                             .h(px(self.title_bar_height()))
                             .flex_none()
                             .px(px(Metrics::TOOLBAR_EDGE_INSET))
@@ -5650,8 +5679,14 @@ impl TerminalPane {
                             .items_center()
                             .justify_between()
                             .bg(colors.work_surface_nested())
-                            .child(div().flex().items_center().children(sidebar_reveal))
-                            .children(inspector_toggle),
+                            .child(
+                                div()
+                                    .opacity(self.title_opacity)
+                                    .flex()
+                                    .items_center()
+                                    .children(sidebar_reveal),
+                            )
+                            .child(div().opacity(self.title_opacity).children(inspector_toggle)),
                     )
                 })
                 .child(self.render_empty_workbench(colors))

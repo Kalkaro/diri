@@ -14,7 +14,6 @@ use diri_proto::{AgentAccountProfile, AgentKind, SwitchAccountResult};
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     process::{Command, Stdio},
     time::{Instant, SystemTime},
 };
@@ -34,34 +33,20 @@ fn failure() -> ControlError {
 
 fn directory(path: &Path) -> Result<(), ControlError> {
     if !path.exists() {
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(path)
-            .map_err(|_| failure())?;
+        diri_platform::security::private_dir_all(path).map_err(|_| failure())?;
     }
-    let m = fs::symlink_metadata(path).map_err(|_| failure())?;
-    if !m.is_dir()
-        || m.file_type().is_symlink()
-        || m.uid() != unsafe { libc::geteuid() }
-        || m.mode() & 0o022 != 0
-    {
-        return Err(failure());
-    }
+    diri_platform::security::validate_directory(path, 0o022).map_err(|_| failure())?;
     Ok(())
 }
 
 pub(super) fn read_private(path: &Path) -> Result<Option<Vec<u8>>, ControlError> {
-    let file = match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
+    let file = match diri_platform::security::open_regular(path, false, false, false) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(failure()),
     };
     let m = file.metadata().map_err(|_| failure())?;
-    if !m.is_file() || m.uid() != unsafe { libc::geteuid() } || m.len() > LIMIT {
+    if diri_platform::security::validate_file(&file, false).is_err() || m.len() > LIMIT {
         return Err(failure());
     }
     let mut bytes = Vec::new();
@@ -78,13 +63,7 @@ pub(super) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), ControlErro
     directory(path.parent().ok_or_else(failure)?)?;
     let temp = path.with_file_name(format!(".write-{}.tmp", crate::inject::uuid_v4()));
     let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temp)
-            .map_err(|_| failure())?;
+        let mut file = diri_platform::security::create_private(&temp).map_err(|_| failure())?;
         file.write_all(bytes)
             .and_then(|_| file.sync_all())
             .map_err(|_| failure())?;
@@ -405,7 +384,13 @@ impl ControlServer {
     }
 
     pub(super) fn claude_home(&self) -> Result<PathBuf, ControlError> {
-        let home = PathBuf::from(std::env::var("HOME").map_err(|_| failure())?).join(".claude");
+        let home = PathBuf::from(
+            diri_platform::home_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .ok_or(std::env::VarError::NotPresent)
+                .map_err(|_| failure())?,
+        )
+        .join(".claude");
         directory(&home)?;
         Ok(home)
     }
@@ -505,31 +490,49 @@ impl ControlServer {
         // This sign-in may land another account than the slot held.
         Self::forget_claude_identity(&slot);
         let title = format!("Claude sign in · {}", profile.label);
-        let argv = super::account_switch::sign_in_argv(
-            std::env::var("SHELL").ok(),
-            &[
-                "/usr/bin/env".into(),
-                "-u".into(),
-                "ANTHROPIC_API_KEY".into(),
-                "-u".into(),
-                "ANTHROPIC_AUTH_TOKEN".into(),
-                "-u".into(),
-                "CLAUDE_CODE_OAUTH_TOKEN".into(),
-                // Signing in records the account in the config directory's
-                // `.claude.json`. Keep that record in the slot: in the shared
-                // one it would name this account while new tabs still use
-                // another. Both variables name the slot, so the credential
-                // store is the slot's whichever one Claude reads.
-                format!("CLAUDE_CONFIG_DIR={}", slot.display()),
-                format!("CLAUDE_SECURESTORAGE_CONFIG_DIR={}", slot.display()),
-                binary,
-                "auth".into(),
-                "login".into(),
-            ],
-        );
-        self.session_spawn(Some(
-            json!({"kind": AgentKind::SHELL, "cwd": slot, "title": title, "argv": argv}),
-        ))
+        #[cfg(windows)]
+        {
+            let script_path = slot.join("diri-login.ps1");
+            write_private(&script_path, br#"param([string]$Slot, [string]$Agent)
+$ErrorActionPreference = 'Stop'
+Remove-Item Env:ANTHROPIC_API_KEY, Env:ANTHROPIC_AUTH_TOKEN, Env:CLAUDE_CODE_OAUTH_TOKEN -ErrorAction SilentlyContinue
+# The slot is both the config and credential directory, as on Unix below.
+$env:CLAUDE_CONFIG_DIR = $Slot
+$env:CLAUDE_SECURESTORAGE_CONFIG_DIR = $Slot
+& $Agent auth login
+exit $LASTEXITCODE
+"#)?;
+            self.session_spawn(Some(json!({"kind": AgentKind::SHELL, "cwd": slot, "title": title,
+                "argv": [diri_platform::launch::default_shell(), "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script_path, slot, binary]})))
+        }
+        #[cfg(unix)]
+        {
+            let argv = super::account_switch::sign_in_argv(
+                std::env::var("SHELL").ok(),
+                &[
+                    "/usr/bin/env".into(),
+                    "-u".into(),
+                    "ANTHROPIC_API_KEY".into(),
+                    "-u".into(),
+                    "ANTHROPIC_AUTH_TOKEN".into(),
+                    "-u".into(),
+                    "CLAUDE_CODE_OAUTH_TOKEN".into(),
+                    // Signing in records the account in the config directory's
+                    // `.claude.json`. Keep that record in the slot: in the shared
+                    // one it would name this account while new tabs still use
+                    // another. Both variables name the slot, so the credential
+                    // store is the slot's whichever one Claude reads.
+                    format!("CLAUDE_CONFIG_DIR={}", slot.display()),
+                    format!("CLAUDE_SECURESTORAGE_CONFIG_DIR={}", slot.display()),
+                    binary,
+                    "auth".into(),
+                    "login".into(),
+                ],
+            );
+            self.session_spawn(Some(
+                json!({"kind": AgentKind::SHELL, "cwd": slot, "title": title, "argv": argv}),
+            ))
+        }
     }
 
     /// The store the default local Claude profile launches with, if any.
@@ -766,8 +769,10 @@ fn first_json_object(out: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     #[test]
     fn a_helper_that_outlives_its_deadline_is_killed_and_reaped() {
         let mut child = Command::new("/bin/sleep")
@@ -816,6 +821,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn identity_snapshot_and_install_round_trip_under_the_config_lock() {
         let tmp = tempfile::tempdir().unwrap();
@@ -871,6 +877,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn file_backed_login_copies_into_the_slot_with_private_permissions() {
@@ -892,6 +899,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn shared_claude_switch_relaunches_open_tabs_with_the_profile_store() {
         let tmp = tempfile::tempdir().unwrap();

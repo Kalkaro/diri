@@ -11,8 +11,8 @@
 //! `not_found` control error, which is what an older daemon does for a method
 //! it does not know, rather than dropping the connection.
 
+use diri_platform::ipc::{UnixListener, UnixStream};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -53,9 +53,42 @@ const fn default_shell() -> &'static str {
     "/bin/zsh"
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 const fn default_shell() -> &'static str {
     "/bin/sh"
+}
+
+#[cfg(windows)]
+const fn default_shell() -> &'static str {
+    "powershell.exe"
+}
+fn local_shell_argv(command: Option<&str>) -> Vec<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| default_shell().into());
+    #[cfg(unix)]
+    {
+        match command {
+            Some(command) => vec![shell, "-lc".into(), command.into()],
+            None => vec![shell, "-l".into()],
+        }
+    }
+    #[cfg(windows)]
+    {
+        let name = Path::new(&shell)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        match (name.as_str(), command) {
+            ("cmd", Some(command)) => vec![shell, "/D".into(), "/C".into(), command.into()],
+            ("cmd", None) => vec![shell, "/D".into()],
+            ("bash" | "sh" | "zsh" | "fish", Some(command)) => {
+                vec![shell, "-lc".into(), command.into()]
+            }
+            ("bash" | "sh" | "zsh" | "fish", None) => vec![shell, "-l".into()],
+            (_, Some(command)) => vec![shell, "-NoLogo".into(), "-Command".into(), command.into()],
+            (_, None) => vec![shell, "-NoLogo".into()],
+        }
+    }
 }
 
 /// Requests that act on a Session's terminal or process. A note Session
@@ -97,8 +130,7 @@ fn terminal_settings(config_dir: &Path) -> diri_proto::TerminalConfigureParams {
 
 /// A terminal's shell: the user's own, as a login shell.
 fn login_shell_argv() -> Vec<String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| default_shell().into());
-    vec![shell, "-l".into()]
+    local_shell_argv(None)
 }
 
 /// Where a fresh shell for an existing local terminal starts: the directory it
@@ -193,7 +225,7 @@ fn local_session_uses_worktree(record: &diri_proto::SessionRecord, target: &Path
         .into_iter()
         .chain(std::iter::once(record.cwd.as_str()))
         .any(|path| {
-            std::fs::canonicalize(path).map_or_else(
+            diri_platform::canonicalize(path).map_or_else(
                 |_| {
                     let path = Path::new(path);
                     path == target || path.starts_with(target)
@@ -500,7 +532,7 @@ impl ControlServer {
         let Ok(bindings) = store.load_all() else {
             return Vec::new();
         };
-        let hosts = diri_proto::HostsConfig::load(self.hosts_file());
+        let hosts = crate::wsl::catalog(self.hosts_file());
         // Clone the engine under the lock, then let it go. Every step below is an SSH
         // round trip, and a delegated fleet is dozens of bindings on one host:
         // holding the Registry across all of them blocked attaches, hook
@@ -1153,12 +1185,7 @@ impl ControlServer {
             Method::HOST_INITIALIZE => self.host_initialize(params),
             Method::HOST_USAGE => self.host_usage(params),
             Method::HOST_LIST_DIRECTORIES => self.host_list_directories(params),
-            Method::HOST_LIST => Ok(
-                json!({"hosts": diri_proto::HostsConfig::load(self.hosts_file())
-                .hosts.iter().map(|host| json!({
-                    "id": host.id, "name": host.display_name(), "defaultCwd": host.default_cwd
-                })).collect::<Vec<_>>() }),
-            ),
+            Method::HOST_LIST => encode(&crate::wsl::catalog(self.hosts_file())),
             Method::SESSION_MIGRATE => self.session_migrate(params),
             Method::SESSION_REPARENT_WORKTREE => self.session_reparent_worktree(params),
             Method::HOST_LOCATE_REPO => self.host_locate_repo(params),
@@ -1278,7 +1305,19 @@ impl ControlServer {
         // argv keeps manifest launch behavior; an explicit malformed argv must
         // never silently drop arguments or fall back to a login shell.
         let argv = decode_launch_argv(&raw)?;
-        let p: diri_proto::SessionSpawnParams = decode(Some(raw))?;
+        let mut p: diri_proto::SessionSpawnParams = decode(Some(raw))?;
+        if let Some((host, cwd)) =
+            crate::wsl::route_unc(&p.cwd, &crate::wsl::catalog(self.hosts_file()))
+                .map_err(io_control_error)?
+        {
+            if p.host.as_ref().is_some_and(|requested| requested != &host) {
+                return Err(ControlError::bad_request(
+                    "The project path belongs to a different WSL distribution",
+                ));
+            }
+            p.host = Some(host);
+            p.cwd = cwd;
+        }
         // A note runs nothing: no account, argv, or holder applies.
         if p.kind.id() == diri_proto::AgentKind::NOTE_ID {
             return self.session_spawn_note(p, reserved_id);
@@ -1295,9 +1334,12 @@ impl ControlServer {
             && profile.agent == "codex"
             && !profile.is_default
             && (profile.config_home == "~/.codex"
-                || std::env::var("HOME").is_ok_and(|home| {
-                    PathBuf::from(home).join(".codex") == Path::new(&profile.config_home)
-                }))
+                || diri_platform::home_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .ok_or(std::env::VarError::NotPresent)
+                    .is_ok_and(|home| {
+                        PathBuf::from(home).join(".codex") == Path::new(&profile.config_home)
+                    }))
         {
             return Err(ControlError::bad_request(
                 "Select this Codex account in the bottom-left menu before starting a conversation. Shared-home profiles use the active login.",
@@ -1313,11 +1355,8 @@ impl ControlServer {
         // A generic kind carries the user's command line inside itself.
         let argv = if argv.is_empty() {
             match p.kind.command() {
-                Some(command) if !command.is_empty() => {
-                    let shell = std::env::var("SHELL").unwrap_or_else(|_| default_shell().into());
-                    vec![shell, "-lc".into(), command.to_string()]
-                }
-                _ if kind == diri_proto::AgentKind::SHELL_ID => login_shell_argv(),
+                Some(command) if !command.is_empty() => local_shell_argv(Some(command)),
+                _ if kind == diri_proto::AgentKind::SHELL_ID => local_shell_argv(None),
                 _ => Vec::new(),
             }
         } else {
@@ -1406,7 +1445,7 @@ impl ControlServer {
             agent_session_id = plan.agent_session_id;
         }
 
-        let inherited: Vec<(String, String)> = std::env::vars().collect();
+        let inherited: Vec<(String, String)> = diri_platform::launch::local_environment();
         // A terminal may start where another terminal had `cd`'d to, while
         // `cwd` keeps it in the project it was opened from.
         let start_directory = p
@@ -1534,7 +1573,9 @@ impl ControlServer {
             if let Some(uuid) = &agent_session_id {
                 record.agent_session_id = Some(uuid.clone());
                 if descriptor.injection.claude_hooks
-                    && let Ok(home) = std::env::var("HOME")
+                    && let Ok(home) = diri_platform::home_dir()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .ok_or(std::env::VarError::NotPresent)
                 {
                     record.transcript_path = Some(
                         record
@@ -1954,7 +1995,7 @@ impl ControlServer {
                 .map_err(io_control_error)?
         };
         let cwd = PathBuf::from(&captured.cwd);
-        if !cwd.is_absolute() {
+        if !captured.cwd.starts_with('/') {
             return Err(ControlError::internal(
                 "remote Helper returned a non-absolute cwd",
             ));
@@ -1980,7 +2021,12 @@ impl ControlServer {
                 .iter()
                 .rev()
                 .find(|(name, value)| name == "HOME" && !value.is_empty())
-                .map(|(_, home)| Path::new(home).join(".diri/session-storage").join(&id));
+                .map(|(_, home)| {
+                    PathBuf::from(format!(
+                        "{}/.diri/session-storage/{id}",
+                        home.trim_end_matches('/')
+                    ))
+                });
             let plan = descriptor
                 .conversation_plan(
                     &launch_args,
@@ -2286,7 +2332,9 @@ impl ControlServer {
             .as_deref()
             .map(|host| self.resolve_host(host))
             .transpose()?;
-        let home = std::env::var("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or(std::env::VarError::NotPresent)
             .map(PathBuf::from)
             .map_err(|_| ControlError::internal("HOME is not set"))?;
 
@@ -2442,10 +2490,10 @@ impl ControlServer {
         params: Option<JsonValue>,
     ) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionReparentWorktreeParams = decode(params)?;
-        let project_root = std::fs::canonicalize(&p.project_root).map_err(|error| {
+        let project_root = diri_platform::canonicalize(&p.project_root).map_err(|error| {
             ControlError::bad_request(format!("project root is unavailable: {error}"))
         })?;
-        let worktree_path = std::fs::canonicalize(&p.worktree_path).map_err(|error| {
+        let worktree_path = diri_platform::canonicalize(&p.worktree_path).map_err(|error| {
             ControlError::bad_request(format!("worktree is unavailable: {error}"))
         })?;
         let worktrees = crate::git::list_worktrees(&project_root).map_err(|error| {
@@ -2515,7 +2563,9 @@ impl ControlServer {
     fn host_sync_prefs(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::HostSyncPrefsParams = decode(params)?;
         let entry = self.resolve_host(&p.host)?;
-        let home = std::env::var("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or(std::env::VarError::NotPresent)
             .map(PathBuf::from)
             .map_err(|_| ControlError::internal("HOME is not set"))?;
         encode(&crate::hosts::sync_prefs(&entry, &home))
@@ -2600,7 +2650,19 @@ impl ControlServer {
     /// requested execution machine. Remote work stays behind the Engine and
     /// uses the verified Helper over `ssh -T`; the app never executes SSH.
     fn host_list_directories(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
-        let p: diri_proto::HostListDirectoriesParams = decode(params)?;
+        let mut p: diri_proto::HostListDirectoriesParams = decode(params)?;
+        if let Some((host, path)) =
+            crate::wsl::route_unc(&p.path, &crate::wsl::catalog(self.hosts_file()))
+                .map_err(io_control_error)?
+        {
+            if p.host.as_ref().is_some_and(|requested| requested != &host) {
+                return Err(ControlError::bad_request(
+                    "The path belongs to a different WSL distribution",
+                ));
+            }
+            p.host = Some(host);
+            p.path = path;
+        }
         let request = diri_proto::remote_pty::DirectoryListRequest {
             path: p.path,
             mode: p.mode,
@@ -2673,7 +2735,7 @@ impl ControlServer {
     /// Resolves a host id against `hosts.json`, read fresh each call so
     /// Settings edits apply without a daemon restart.
     fn resolve_host(&self, host_id: &str) -> Result<diri_proto::HostEntry, ControlError> {
-        diri_proto::HostsConfig::load(self.hosts_file())
+        crate::wsl::catalog(self.hosts_file())
             .hosts
             .into_iter()
             .find(|entry| entry.id == host_id)
@@ -3822,7 +3884,7 @@ impl ControlServer {
                 .map_err(io_control_error)?
         };
         let cwd = PathBuf::from(&captured.cwd);
-        if !cwd.is_absolute() {
+        if !captured.cwd.starts_with('/') {
             return Err(ControlError::internal(
                 "remote Helper returned a non-absolute cwd",
             ));
@@ -3835,9 +3897,10 @@ impl ControlServer {
             .rev()
             .find(|variable| variable.name == "HOME" && !variable.value.is_empty())
             .map(|variable| {
-                Path::new(&variable.value)
-                    .join(".diri/session-storage")
-                    .join(target_id)
+                PathBuf::from(format!(
+                    "{}/.diri/session-storage/{target_id}",
+                    variable.value.trim_end_matches('/')
+                ))
             });
         let launch = match action {
             ConversationAction::Resume => crate::agent::ConversationLaunch::Resume {
@@ -4192,7 +4255,7 @@ impl ControlServer {
             })?
             .args;
 
-        let inherited: Vec<(String, String)> = std::env::vars().collect();
+        let inherited: Vec<(String, String)> = diri_platform::launch::local_environment();
         let mut pty = descriptor
             .spawn_spec(Path::new(cwd), inherited, &launch_args)
             .ok_or_else(|| ControlError::internal("resume spec without a binary"))?;
@@ -4578,6 +4641,27 @@ impl ControlServer {
             let descriptor = raw_descriptor.and_then(|value| {
                 serde_json::from_value::<diri_proto::AgentDescriptor>(value).ok()
             });
+            #[cfg(windows)]
+            let descriptor = descriptor.map(|mut descriptor| {
+                if params.host.is_none() && let Some(setup) = &mut descriptor.setup {
+                    // POSIX installer snippets must never be typed into PowerShell.
+                    setup.install_command = match id.as_str() {
+                        "claude-code" => Some("irm https://claude.ai/install.ps1 | iex".into()),
+                        "codex" => Some("npm.cmd install -g @openai/codex".into()),
+                        "gemini" => Some("npm.cmd install -g @google/gemini-cli".into()),
+                        _ => None,
+                    };
+                    setup.install_requirement = match id.as_str() {
+                        "claude-code" => Some("Git for Windows".into()),
+                        "codex" | "gemini" => Some("Node.js with npm".into()),
+                        _ => None,
+                    };
+                    if setup.install_command.is_none() {
+                        setup.install_hint = Some("Use the vendor's Windows installer, or select a WSL host for its Linux CLI.".into());
+                    }
+                }
+                descriptor
+            });
             let signed_in = if params.host.is_none() && path.is_some() {
                 self.agent_signed_in(&id)
             } else {
@@ -4887,7 +4971,9 @@ impl ControlServer {
             let registry = self.registry.lock().map_err(poisoned)?;
             registry.tracked_agent_session_ids()
         };
-        let home = std::env::var("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or(std::env::VarError::NotPresent)
             .map(PathBuf::from)
             .map_err(|_| ControlError::internal("HOME is not set"))?;
         let entries: Vec<diri_proto::HistoryEntry> = crate::history::scan(&home, &tracked)
@@ -4967,7 +5053,10 @@ fn previous_screen_size(spec: &crate::session::SessionSpec) -> Option<(usize, us
 }
 
 fn claude_resume_target(record: &diri_proto::SessionRecord) -> Option<Option<String>> {
-    claude_resume_target_in(record, Path::new(&std::env::var_os("HOME")?))
+    claude_resume_target_in(
+        record,
+        Path::new(&diri_platform::home_dir().map(|p| p.into_os_string())?),
+    )
 }
 
 fn claude_resume_target_in(
@@ -5142,8 +5231,8 @@ fn note_home(project: Option<&str>, requested: Option<&str>) -> Result<String, C
         .find(|path| Path::new(path).is_dir())
         .map(str::to_owned)
         .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|home| Path::new(home).is_dir())
+            diri_platform::home_dir()
+                .filter(|home| home.is_dir())
                 .map(|home| home.to_string_lossy().into_owned())
         })
         .ok_or_else(|| ControlError::internal("no folder to place the note in"))
@@ -6827,9 +6916,13 @@ const MAX_PROBE_CHARS: usize = 20;
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     mod agent_relaunch_tests;
+    #[cfg(unix)]
     mod find_capture_tests;
+    #[cfg(unix)]
     mod reconnect_tests;
+    #[cfg(unix)]
     mod send_key_tests;
 
     #[test]
@@ -7153,7 +7246,7 @@ mod tests {
             attention_state: None,
             id: SessionId(id.into()),
             kind: AgentKind::SHELL,
-            cwd: "/tmp".into(),
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
             project_id: ProjectId("p".into()),
             worktree_path: None,
             git_branch: None,
@@ -7220,8 +7313,8 @@ mod tests {
             target.to_str().expect("utf8 target"),
         ]);
         (
-            repo.canonicalize().expect("repo"),
-            target.canonicalize().expect("target"),
+            diri_platform::canonicalize(repo).expect("repo"),
+            diri_platform::canonicalize(target).expect("target"),
         )
     }
 
@@ -7568,7 +7661,10 @@ mod tests {
         let by_note = |id: &str| notes.iter().find(|r| r.note_id.as_deref() == Some(id));
         assert_eq!(notes.len(), 3);
         assert_eq!(by_note(&offline).unwrap().cwd, project);
-        let home = std::env::var("HOME").unwrap();
+        let home = diri_platform::home_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             by_note(&inbox).unwrap().cwd,
             home,
@@ -7705,6 +7801,7 @@ mod tests {
     /// A session whose Holder was lost ends without exit facts, so its
     /// terminal is never retained. Reading it says so in a code callers can
     /// stop on, instead of `completed_terminal_unavailable` on every ask.
+    #[cfg(unix)]
     #[test]
     fn reading_a_lost_session_says_its_screen_was_not_kept() {
         use diri_proto::process::{BootId, ProcessBirth, ProcessIdentity};
@@ -7766,6 +7863,7 @@ mod tests {
         assert_eq!(unknown.code, "not_found");
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_screen_serves_a_retained_terminal_for_a_completed_session() {
         use diri_proto::process::{BootId, ProcessBirth, ProcessIdentity};
@@ -8058,8 +8156,10 @@ mod tests {
         assert!(cursor_descriptor.injection.cursor_hooks);
     }
 
+    #[cfg(unix)]
     #[test]
     fn resuming_an_agent_directly_executes_the_agent() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
 
         let temp = tempfile::tempdir().expect("temp");
@@ -8163,8 +8263,10 @@ mod tests {
         assert!(configure(json!([])).is_empty(), "an empty list clears them");
     }
 
+    #[cfg(unix)]
     #[test]
     fn account_binding_survives_profile_edits_removal_resume_and_fork() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let server = server(temp.path());
@@ -8271,6 +8373,7 @@ mod tests {
         assert!(server.session_spawn(Some(json!({"kind": diri_proto::AgentKind::CODEX, "cwd": temp.path(), "accountProfileId": "work"}))).is_err());
     }
 
+    #[cfg(unix)]
     /// Without a manual path the manifest's binary stays bare: the interactive
     /// login shell (or `spawn_spec`'s PATH absolutization) resolves it at
     /// launch against nvm/mise/Homebrew PATHs the daemon never inherited.
@@ -8278,6 +8381,7 @@ mod tests {
     /// spawns the login shell can serve, and pin versions to daemon startup.
     #[test]
     fn local_spawns_keep_the_bare_binary_unless_a_path_is_configured() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().expect("temp");
         let server = server(temp.path());
@@ -8314,6 +8418,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn history_resume_keeps_the_identity_needed_for_another_resume() {
         let temp = tempfile::tempdir().expect("temp");
@@ -8411,6 +8516,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     /// An agent that dies on its own — a dropped ssh, a crash — leaves its
     /// session in the registry, because only an explicit kill takes one out.
     /// Resume used to read that presence as "already live", call itself a
@@ -8421,6 +8527,7 @@ mod tests {
         check_resume_relaunches(false);
     }
 
+    #[cfg(unix)]
     #[test]
     fn revive_archived_session_clears_archive_durably() {
         check_resume_relaunches(true);
@@ -8574,6 +8681,7 @@ mod tests {
     /// took its Holder) with `cwd` the project and `terminal_cwd` wherever it
     /// had `cd`'d to. `/usr/bin/false` stands in for the shell that went away;
     /// its non-zero exit is not the user closing the tab.
+    #[cfg(unix)]
     fn dead_terminal(
         temp: &Path,
         terminal_cwd: Option<&Path>,
@@ -8623,6 +8731,7 @@ mod tests {
     }
 
     /// Where the resumed shell's own process sits, as the Engine samples it.
+    #[cfg(unix)]
     fn wait_for_live_directory(registry: &Arc<Mutex<Registry>>, expected: &Path) {
         let expected = expected.to_string_lossy().into_owned();
         let mut last = None;
@@ -8640,6 +8749,7 @@ mod tests {
         panic!("the resumed shell runs in {last:?}, not {expected}");
     }
 
+    #[cfg(unix)]
     fn stop_terminal(registry: &Arc<Mutex<Registry>>) {
         let _ = registry
             .lock()
@@ -8650,6 +8760,7 @@ mod tests {
     /// A terminal that comes back after its shell died starts in the directory
     /// it had `cd`'d to, keeps its project, and says so before the new shell
     /// has been sampled.
+    #[cfg(unix)]
     #[test]
     fn a_resumed_terminal_starts_in_its_last_directory() {
         let temp = tempfile::tempdir().expect("temp");
@@ -8687,6 +8798,7 @@ mod tests {
     /// A directory deleted while the terminal was down is not an error: the
     /// shell starts in the project, as it always did, and stops claiming the
     /// vanished directory.
+    #[cfg(unix)]
     #[test]
     fn a_resumed_terminal_whose_directory_vanished_starts_in_its_project() {
         let temp = tempfile::tempdir().expect("temp");
@@ -8708,6 +8820,7 @@ mod tests {
     /// Only a local shell restarts in its last directory. Agents re-enter
     /// their conversation in `cwd`, remote shells are left to the Helper, and
     /// nothing but an existing absolute directory is trusted.
+    #[cfg(unix)]
     #[test]
     fn only_a_local_terminal_restores_an_existing_absolute_directory() {
         let temp = tempfile::tempdir().expect("temp");
@@ -8739,6 +8852,7 @@ mod tests {
         assert_eq!(restored_terminal_directory(&shell), None);
     }
 
+    #[cfg(unix)]
     fn check_resume_relaunches(archived: bool) {
         let temp = tempfile::tempdir().expect("temp");
         // A manifest that resumes by flag, onto a binary that outlives the
@@ -9020,6 +9134,7 @@ mod tests {
         assert_eq!(list["sessions"].as_array().map(Vec::len), Some(0));
     }
 
+    #[cfg(unix)]
     #[test]
     fn mark_unread_returns_a_seen_completion_to_done_unseen() {
         use diri_proto::{AgentKind, AttentionLevel, DateMillis, SessionRecord};
@@ -9070,6 +9185,7 @@ mod tests {
         assert_eq!(error.code, "not_found");
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_subagent_completion_does_not_finish_the_parent_turn() {
         let temp = tempfile::tempdir().unwrap();
@@ -9098,6 +9214,9 @@ mod tests {
             let mut registry = server.registry.lock().unwrap();
             let mut record = test_record("s_codex");
             record.kind = diri_proto::AgentKind::CODEX;
+            // Transcript acceptance compares cwd exactly. test_record uses the
+            // OS temp directory, which is not /tmp on macOS or Windows.
+            record.cwd = "/tmp".into();
             record.agent_session_id = Some("parent".into());
             record.account_profile = Some(diri_proto::AgentAccountProfile {
                 id: "test".into(),
@@ -9160,9 +9279,39 @@ mod tests {
                     "payload": {"type": "agent-turn-complete", "thread-id": thread}
                 })),
             ));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !server.hook_reports.is_idle() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "hook queue did not drain"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
             let registry = server.registry.lock().unwrap();
             let session = registry.get("s_codex").unwrap();
-            session.feed_signal(crate::status::StatusSignal::Tick);
+            if !thread.contains("child") {
+                assert!(
+                    registry
+                        .record("s_codex")
+                        .unwrap()
+                        .transcript_path
+                        .is_some(),
+                    "parent transcript not accepted: {thread}"
+                );
+            }
+            // A strong idle hint settles on a later tick, after the reducer's
+            // confirmation delay. An immediate Tick is not that contract.
+            loop {
+                session.feed_signal(crate::status::StatusSignal::Tick);
+                if thread.contains("child") || session.status() == diri_proto::SessionStatus::Idle {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "parent completion did not settle"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
             assert_eq!(
                 session.status(),
                 if thread.contains("child") {
@@ -9415,6 +9564,7 @@ mod tests {
         assert_eq!(empty.code, "bad_request");
     }
 
+    #[cfg(unix)]
     #[test]
     fn reopening_a_resumable_session_relaunches_it() {
         let temp = tempfile::tempdir().expect("temp");
@@ -9779,6 +9929,7 @@ mod tests {
         assert_eq!(record.worktree_path, None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn worktree_reparent_refuses_unknown_session_inside_symlinked_subdirectory() {
         let temp = tempfile::tempdir().expect("temp");
@@ -9906,8 +10057,10 @@ mod tests {
     #[test]
     fn host_initialization_fails_closed_without_the_remote_transport() {
         let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("private");
         diri_proto::HostsConfig {
             hosts: vec![diri_proto::HostEntry {
+                transport: Default::default(),
                 id: "forge".into(),
                 name: Some("Forge".into()),
                 ssh: "you@forge".into(),
@@ -9915,9 +10068,9 @@ mod tests {
                 node: None,
             }],
         }
-        .save(temp.path().join("hosts.json"))
+        .save(root.join("hosts.json"))
         .expect("host catalog");
-        let server = server(temp.path());
+        let server = server(&root);
 
         let error = err_of(call(
             &server,
@@ -9940,6 +10093,7 @@ mod tests {
         diri_proto::HostsConfig {
             hosts: vec![diri_proto::HostEntry {
                 id: "forge".into(),
+                transport: Default::default(),
                 name: Some("Forge".into()),
                 ssh: "you@forge".into(),
                 default_cwd: None,
@@ -10002,8 +10156,10 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_socket_is_owner_only() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().expect("temp");
         let server = server(temp.path());
@@ -10351,7 +10507,9 @@ mod tests {
             assert!(
                 error.message.contains("not-a-directory")
                     || error.message.contains("Not a directory")
-                    || error.message.contains("File exists"),
+                    || error.message.contains("File exists")
+                    // Windows: ERROR_ALREADY_EXISTS creating the parent.
+                    || error.message.contains("os error 183"),
                 "unexpected persistence error: {error}"
             );
         }

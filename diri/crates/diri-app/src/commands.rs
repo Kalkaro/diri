@@ -2124,7 +2124,7 @@ impl CommandId {
                 category: Application,
             },
             Self::Quit => ShortcutMetadata {
-                title: t("command.quit.title"),
+                title: crate::platform::quit_label(),
                 description: t("command.quit.description"),
                 category: Application,
             },

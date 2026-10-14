@@ -145,7 +145,7 @@
   "settings.skills.copy": "Copiar instrucciones",
   "settings.skills.count_one": "{count} habilidad",
   "settings.skills.count_other": "{count} habilidades",
-  "settings.skills.intro": "Explora las habilidades de este Mac y del proyecto local actual.",
+  "settings.skills.intro": "Explora las habilidades de {machine} y del proyecto local actual.",
   "settings.skills.looking": "Buscando habilidades…",
   "settings.skills.no_match": "Ninguna habilidad coincide con estos filtros.",
   "settings.skills.none_found": "No se encontraron habilidades. Añade una carpeta con SKILL.md al directorio de habilidades de tu agente y actualiza.",

@@ -272,9 +272,10 @@ fn tooltip(
                 .child(div().flex_1().child(text(name, 11.0, colors.secondary)))
                 .child(div().pl(px(12.0)).child(if value.contains(' ') {
                     // "5 hours", "14 of 26": words keep their own spacing.
-                    text(value, 11.0, colors.primary)
+                    text(value, 11.0, colors.primary).into_any_element()
                 } else {
                     crate::number_flow::tabular(value, 11.0, colors.primary, FontWeight::NORMAL)
+                        .into_any_element()
                 }))
         }))
 }

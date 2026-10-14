@@ -32,6 +32,7 @@
   "command.equalize_panes.description": "Da a cada panel de la pestaña el mismo espacio",
   "command.equalize_panes.palette_title": "Igualar paneles",
   "command.equalize_panes.title": "Igualar paneles",
+  "command.exit.title": "Salir de Diri",
   "command.export_scrollback.description": "Abre la salida retenida del terminal en tu editor de texto",
   "command.export_scrollback.palette_title": "Abrir historial en el editor",
   "command.export_scrollback.title": "Abrir historial en el editor",

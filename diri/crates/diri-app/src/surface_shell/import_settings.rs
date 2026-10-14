@@ -14,7 +14,9 @@ impl UtilitySurfaces {
         let detail = match &plan {
             _ if importing => t("settings.import.opening").to_owned(),
             None => t("settings.import.looking").to_owned(),
-            Some(plan) if !plan.found => t("settings.import.none_found").to_owned(),
+            Some(plan) if !plan.found => {
+                tf("settings.import.none_found", &[("machine", &crate::platform::local_machine_label_lowercase())])
+            }
             Some(plan) if plan.is_empty() => t("settings.import.all_imported").to_owned(),
             Some(plan) => plan.summary(),
         };

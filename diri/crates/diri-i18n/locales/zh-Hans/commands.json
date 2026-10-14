@@ -32,6 +32,7 @@
   "command.equalize_panes.description": "让此标签页的每个窗格大小相同",
   "command.equalize_panes.palette_title": "均分窗格",
   "command.equalize_panes.title": "均分窗格",
+  "command.exit.title": "退出 Diri",
   "command.export_scrollback.description": "在文本编辑器中打开保留的终端输出",
   "command.export_scrollback.palette_title": "在编辑器中打开回滚内容",
   "command.export_scrollback.title": "在编辑器中打开回滚内容",

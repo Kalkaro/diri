@@ -129,7 +129,26 @@ cursor from it, so a panel and the window under it would fight over the
 cursor (an arrow against an I-beam while a terminal streams beneath the
 palette).
 
-## 4. Scene region capture (`Window::capture_region`)
+## 4. Window control areas survive cached views and yield to buttons
+
+Diri draws its own caption on Windows (`crates/diri-app/src/window_chrome.rs`):
+title-row toolbars are `WindowControlArea::Drag` and the caption buttons are
+`Min`/`Max`/`Close`, which `gpui_windows` answers `WM_NCHITTEST` with.
+
+**Upstream behavior.** `reuse_paint` did not copy `window_control_hitboxes`,
+so a cached view (the sidebar, every terminal pane) lost its drag area on the
+first frame it was reused. And the hit-test callback returned the first area
+whose hitbox was anywhere under the pointer, so a button inside a drag area
+moved the window unless the button occluded.
+
+**Patch.** `PaintIndex` carries `window_control_hitboxes_index` (with
+`relative_to`/`rebased_on`) and `reuse_paint` copies the range. The callback
+and the new `Window::window_control_area_at` share
+`window_control_area_for`: an area claims the pointer only when its own hitbox
+is the frontmost one there. Test in `crates/diri-app/src/root.rs`:
+`windows_caption_buttons_sit_in_the_toolbar_for_both_tab_orientations`.
+
+## 5. Scene region capture (`Window::capture_region`)
 
 Upstream can only read a rendered frame back in test builds
 (`render_to_image`, behind `test-support`), and only as a whole-window RGBA
@@ -164,8 +183,9 @@ frame.
    `force_render_if`,
    `ViewElementState`, `ViewElementCacheKey`), `window.rs` (index
    `relative_to`/`rebased_on`, `CachedViewBase*`, base stacks, deferred-draw
-   bases, `insert_debug_bounds`, `debug_bounds_history` replay, and the
-   `exempt_from_inactive_throttle` frame-rate exemption),
+   bases, `insert_debug_bounds`, `debug_bounds_history` replay, the
+   `exempt_from_inactive_throttle` frame-rate exemption, and the window
+   control hitbox reuse and `window_control_area_for`),
    `text_system/line_layout.rs` (`LineLayoutIndex` arithmetic),
    `elements/div.rs` (prepaint opacity, `insert_debug_bounds`), and the scene
    capture: `platform.rs` (`capture_scene_region`, `SceneCapture`),
