@@ -7225,9 +7225,10 @@ mod tests {
             )
             .unwrap();
         assert!(server.terminal_shell_integration().is_none());
-        let settings = temp.path().join(TERMINAL_SETTINGS_FILE);
+        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let settings = temp.path().join(TERMINAL_SETTINGS_FILE);
             let mode = std::fs::metadata(&settings).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
@@ -7603,6 +7604,7 @@ mod tests {
         (registry, server)
     }
 
+    #[cfg(unix)]
     /// Attaches over a socket pair and returns everything the Engine wrote
     /// before it closed.
     fn refused_attach(server: &Arc<ControlServer>, id: &str) -> Vec<diri_proto::frames::Frame> {
@@ -7627,6 +7629,7 @@ mod tests {
             .expect("frames")
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_refused_attach_says_why_before_closing() {
         use diri_proto::frames::AttachRejection;
@@ -8317,6 +8320,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn configuring_an_agent_without_launch_args_keeps_them() {
         let temp = tempfile::tempdir().expect("temp");
