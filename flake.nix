@@ -89,6 +89,8 @@
           imagemagick,
           copyDesktopItems,
           makeDesktopItem,
+          curl,
+          gzip,
           fontconfig,
           freetype,
           libxkbcommon,
@@ -159,6 +161,11 @@
         rustPlatform.buildRustPackage {
           pname = "diri";
           inherit version src cargoDeps;
+
+          # NixOS has no /usr/bin/curl or /usr/bin/gzip; diri-platform reads
+          # these at compile time so the package never depends on PATH.
+          env.DIRI_CURL = lib.getExe curl;
+          env.DIRI_GZIP = "${gzip}/bin/gzip";
 
           buildPhase = ''
             runHook preBuild
