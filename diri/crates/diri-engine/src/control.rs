@@ -174,6 +174,7 @@ pub struct ControlServer {
     cli_versions: crate::cli_version::CliVersions,
     governor: std::sync::Arc<Mutex<crate::governor::GovernorConfig>>,
     browser: std::sync::OnceLock<crate::browser::BrowserPool>,
+    computer: crate::computer::ComputerUse,
     active_connections: Arc<AtomicUsize>,
     background_requests: Arc<AtomicUsize>,
     worktree_scan: crate::worktree_scan::ScanStore,
@@ -300,6 +301,7 @@ impl ControlServer {
             cli_versions: Default::default(),
             governor: std::sync::Arc::new(Mutex::new(crate::governor::GovernorConfig::default())),
             browser: std::sync::OnceLock::new(),
+            computer: Default::default(),
             active_connections: Arc::new(AtomicUsize::new(0)),
             background_requests: Arc::new(AtomicUsize::new(0)),
             worktree_scan: Default::default(),
@@ -876,6 +878,8 @@ impl ControlServer {
                         | Method::WORKTREE_OVERVIEW
                         | Method::WORKTREE_CLEANUP
                         | Method::TELEMETRY_UPLOAD_NOW
+                        | Method::COMPUTER_STATUS
+                        | Method::COMPUTER_SETUP
                 ) || ((method == Method::AGENT_READINESS
                     || method == Method::AGENT_CONFIGURE)
                     && params
@@ -1180,6 +1184,18 @@ impl ControlServer {
             Method::WORKTREE_OVERVIEW => self.worktree_overview(),
             Method::TEST_RUN => self.browser_call("run", params),
             "browser.act" => self.browser_call("browser", params),
+            Method::COMPUTER_ACT => self.computer_act(params),
+            Method::COMPUTER_STATUS => {
+                let p: diri_proto::ComputerStatusParams = decode(params)?;
+                encode(&self.computer.status(p.probe))
+            }
+            Method::COMPUTER_SETUP => {
+                let p: diri_proto::ComputerSetupParams = decode(params)?;
+                self.computer
+                    .setup(p.action)
+                    .map_err(|error| ControlError::new(error.code, error.message))
+                    .and_then(|status| encode(&status))
+            }
             Method::EVENTS_WAIT => self.events_wait(params),
             Method::HOST_SYNC_PREFS => self.host_sync_prefs(params),
             Method::HOST_INITIALIZE => self.host_initialize(params),
@@ -2214,6 +2230,60 @@ impl ControlServer {
             code: "browser_pool".into(),
             message: error,
         })
+    }
+
+    /// `computer.act`: one Cua Driver call on behalf of a live session, under
+    /// that session's own cursor badge and app leases.
+    fn computer_act(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::ComputerActParams = decode(params)?;
+        let id = p.session_id.0.clone();
+        let (badge, live) = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let record = registry
+                .record(&id)
+                .filter(|record| !record.is_archived())
+                .ok_or_else(|| ControlError::not_found(format!("no session {id}")))?;
+            let agent = registry
+                .engine()
+                .manifest(record.kind.id())
+                .and_then(|manifest| manifest.agent.as_ref())
+                .and_then(|agent| agent.display_name.clone())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| record.kind.id().to_owned());
+            let badge = cursor_badge(&agent, &record.title);
+            let live: std::collections::HashSet<String> = registry
+                .records()
+                .into_iter()
+                .filter(|record| !record.is_archived() && registry.is_live(&record.id.0))
+                .map(|record| record.id.0)
+                .collect();
+            (badge, live)
+        };
+        let caller = crate::computer::Caller {
+            session_id: &id,
+            badge: &badge,
+        };
+        let result = self
+            .computer
+            .act(&caller, &p.tool, p.args, &|session| live.contains(session));
+        if let Err(error) = &result
+            && matches!(
+                error.code,
+                crate::computer::UNAVAILABLE | crate::computer::PERMISSIONS
+            )
+            && self.computer.should_nudge(&id)
+        {
+            // The app offers to finish setup; only the person can.
+            self.events.publish_encoded(
+                diri_proto::EventName::COMPUTER_SETUP_NEEDED,
+                &diri_proto::ComputerSetupNeededEvent {
+                    session_id: p.session_id.clone(),
+                    badge: badge.clone(),
+                },
+                Some(&id),
+            );
+        }
+        result.map_err(|error| ControlError::new(error.code, error.message))
     }
 
     /// The aggregated staleness view: every worktree of every project,
@@ -5363,6 +5433,26 @@ impl Drop for ActiveConnectionGuard {
     }
 }
 
+/// The words under a session's agent cursor: the agent and the tab, without
+/// saying the agent twice when the tab already names it ("Codex · fix" not
+/// "Codex · Codex · fix"; "Claude · x" for Claude Code).
+fn cursor_badge(agent: &str, title: &str) -> String {
+    let title = title.trim();
+    let first_word = agent.split_whitespace().next().unwrap_or(agent);
+    let named = |word: &str| {
+        title
+            .get(..word.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(word))
+    };
+    if title.is_empty() {
+        agent.to_owned()
+    } else if named(agent) || named(first_word) {
+        title.to_owned()
+    } else {
+        format!("{agent} · {title}")
+    }
+}
+
 /// The last steps of an Engine that has nothing left to look after. Callers
 /// have already persisted the registry and checked that no session is live.
 fn release_idle_engine(
@@ -6963,6 +7053,21 @@ mod tests {
     mod reconnect_tests;
     #[cfg(unix)]
     mod send_key_tests;
+
+    #[test]
+    fn cursor_badges_name_the_agent_once() {
+        assert_eq!(cursor_badge("Codex", "fix login"), "Codex · fix login");
+        assert_eq!(
+            cursor_badge("Codex", "Codex · calculator"),
+            "Codex · calculator"
+        );
+        assert_eq!(
+            cursor_badge("Claude Code", "Claude · settings"),
+            "Claude · settings"
+        );
+        assert_eq!(cursor_badge("Claude Code", "claude code"), "claude code");
+        assert_eq!(cursor_badge("Gemini", "  "), "Gemini");
+    }
 
     #[test]
     fn an_over_budget_session_list_drops_only_pull_request_detail() {
