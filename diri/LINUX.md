@@ -133,9 +133,9 @@ nixGL works by setting `LD_LIBRARY_PATH`, which the terminals Diri starts
 inherit.
 
 The first build downloads only the pinned commit of GPUI and each other Git
-dependency. Right after a dependency bump, until the Nix hashes workflow's pull
-request lands, that dependency's full Git history is cloned instead (about
-1.3 GB for Zed). On NixOS, add the overlay and install `pkgs.diri`:
+dependency. A dependency whose hash is missing from `nix/cargo-git-hashes.json`
+has its full Git history cloned instead (about 1.3 GB for Zed); after bumping a
+Git dependency, run `./scripts/update-nix-hashes.sh` and commit the result. On NixOS, add the overlay and install `pkgs.diri`:
 
 ```nix
 {
