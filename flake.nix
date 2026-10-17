@@ -119,11 +119,22 @@
             cargo = toolchain;
             rustc = toolchain;
           };
-          # Git dependencies (GPUI, xcb, ...) are fetched from the revisions
-          # pinned in Cargo.lock, so dependency bumps need no hash updates here.
+          # Git dependencies (GPUI, xcb, ...) are fetched at the revisions pinned
+          # in Cargo.lock. Those with a hash in nix/cargo-git-hashes.json, keyed
+          # by Cargo.lock source, fetch only that commit. A revision bumped since
+          # the file was regenerated (scripts/update-nix-hashes.sh, run by the
+          # Nix hashes workflow) falls back to builtins.fetchGit, which clones
+          # the whole repository with every branch, tag and pull request: slow
+          # for Zed, but the build still works.
           # Vendored once and shared with the static Helper.
+          gitHashes = lib.importJSON ./nix/cargo-git-hashes.json;
           cargoDeps = rustPlatform.importCargoLock {
             lockFile = ./diri/Cargo.lock;
+            outputHashes = lib.listToAttrs (
+              map (p: lib.nameValuePair "${p.name}-${p.version}" gitHashes.${p.source}) (
+                lib.filter (p: gitHashes ? ${p.source or ""}) (lib.importTOML ./diri/Cargo.lock).package
+              )
+            );
             allowBuiltinFetchGit = true;
           };
 
